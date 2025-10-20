@@ -1,179 +1,170 @@
-# 🏎️ F1TENTH Gym ROS2 통신 브리지 (Communication Bridge)
+# 🏎️ F1TENTH Gym ROS2 Communication Bridge
 
-이 프로젝트는 [F1TENTH Gym](https://github.com/f1tenth/f1tenth_gym) 환경을 **ROS2 시뮬레이션 환경으로 확장**하기 위한  
-**컨테이너 기반 ROS2 통신 브리지(Containerized ROS2 Communication Bridge)** 입니다.
-
-Docker를 이용해 시뮬레이션 환경을 자동으로 구성하며,  
-**키보드 텔레오퍼레이션**, **상대 차량(opponent) 시뮬레이션**, **기능 확장(AEB, Planning 등)** 이 가능합니다.
+이 프로젝트는 **F1TENTH Gym 환경을 ROS2 시뮬레이션으로 확장**하기 위한 **Docker 기반 ROS2 통신 브릿지**입니다.  
+컨테이너 환경에서 시뮬레이션을 실행하고, RViz2를 통한 시각화 및 키보드 원격조종이 가능합니다.
 
 ---
 
-## 📦 1. 사전 준비 (Prerequisites)
+## 📘 개요
 
-ROS2 환경을 구성하기 전에 **Docker**와 **Docker Compose**를 설치해야 합니다.
+이 환경을 통해 다음을 수행할 수 있습니다:
+- F1TENTH Gym을 **Docker 컨테이너 내에서 실행**
+- **RViz2**로 시각화
+- **Keyboard Teleoperation**을 통한 주행 제어
+- **PID, AEB 등 기능 확장 가능**
+- **ROS2 Topic 통신**을 이용한 로컬-컨테이너 간 연동
 
-```bash
-# Docker 및 Docker Compose 설치
-sudo apt update
-sudo apt install docker.io docker-compose -y
-🧱 2. Docker 이미지 빌드
-bash
-코드 복사
-cd f1tenth_gym_ros/
+---
+
+## 🧩 PID 설정 참고 링크
+
+PID 제어기 튜닝 및 시뮬레이션 참고:  
+🔗 [PID Simulator – tech-uofm.info/pid/pid.html](https://tech-uofm.info/pid/pid.html)
+
+---
+
+## 🐳 Docker 환경 설정
+
+> ⚠️ Docker 및 Docker Compose가 설치되어 있어야 합니다.
+
+### 1) Docker 이미지 빌드
+cd f1tenth_gym_ros/  
 docker build -t f1tenth_gym_ros -f Dockerfile .
-🚀 3. 시뮬레이션 실행
-bash
-코드 복사
+
+### 2) Docker 컨테이너 실행
 docker-compose up
-✅ 설명
 
-docker-compose.yml 파일에 정의된 모든 컨테이너를 자동으로 실행 및 연결합니다.
-
-전체 시뮬레이션 환경이 자동으로 구성됩니다.
-
-실행 중인 컨테이너 확인:
-
-bash
-코드 복사
+✅ 설명  
+docker-compose up 명령어는 docker-compose.yml 파일의 설정에 따라 컨테이너를 실행하고, 환경 전체를 자동 구성합니다.  
+실행 중인 컨테이너 확인:  
 docker ps
-🌐 4. 웹 인터페이스 접속
-컨테이너 실행 후, 브라우저에서 아래 주소로 접속합니다:
 
-bash
-코드 복사
-http://localhost:8080/vnc.html
-🐚 5. 컨테이너 내부 접속
-bash
-코드 복사
-docker exec -it f1tenth_gym_ros_sim_1 /bin/bash
-컨테이너 내부 프롬프트(root@xxxx:/sim_ws#)에서 ROS2를 설정하고 시뮬레이션을 실행합니다:
+### 3) Docker 접속 및 실행
+브라우저에서 다음 주소 접속:  
+👉 http://localhost:8080/vnc.html  
 
-bash
-코드 복사
-source /opt/ros/foxy/setup.bash
-source install/local_setup.bash
-ros2 launch f1tenth_gym_ros gym_bridge_launch.py
-➡️ F1TENTH Gym 시뮬레이션이 ROS2 환경에서 구동됩니다.
+이후 터미널에서 다음 명령어 실행:  
+docker exec -it f1tenth_gym_ros_sim_1 /bin/bash  
 
-⌨️ 6. 키보드 텔레오퍼레이션 (Keyboard Teleoperation)
-호스트(내 컴퓨터)에서 아래 명령어를 실행합니다:
+컨테이너 내부에서 아래 명령어 실행:  
+source /opt/ros/foxy/setup.bash  
+source install/local_setup.bash  
+ros2 launch f1tenth_gym_ros gym_bridge_launch.py  
 
-bash
-코드 복사
-cd f1tenth_gym_ros/launch
-rviz2 -d gym_bridge.rviz
-✅ RViz에서 키보드로 차량 조종이 가능합니다.
+✅ 이제 F1TENTH Gym 시뮬레이션이 실행됩니다.
 
-🏁 7. 상대 차량(Opponent) 추가 실행
-f1tenth_gym_ros/config/sim.yaml 파일을 열어 아래 항목을 수정합니다:
+---
 
-yaml
-코드 복사
-# opponent parameters
-num_agent: 2
-컨테이너 내부에서 다시 빌드 및 실행합니다:
+## 🕹️ 키보드 텔레오퍼레이션 (Keyboard Teleoperation)
 
-bash
-코드 복사
-colcon build
-source /opt/ros/foxy/setup.bash
-source install/local_setup.bash
-ros2 launch f1tenth_gym_ros gym_bridge_launch.py
-RViz에서 RobotModel을 추가하고, 토픽을 /opp_robot_description으로 설정하면
-상대 차량이 시각화됩니다.
+로컬 환경에서 아래 명령어를 실행합니다:  
+cd f1tenth_gym_ros/launch  
+rviz2 -d gym_bridge.rviz  
 
-🔄 8. 기능 확장 (예: AEB 추가)
-새로운 ROS2 패키지를 생성하여 기능을 확장할 수 있습니다.
+이제 키보드를 이용하여 차량을 직접 제어할 수 있습니다.
 
-🧩 Step 1. 패키지 생성
-bash
-코드 복사
-cd f1tenth_labs_ws
-ros2 pkg create --build-type ament_python --node-name safety_node lab2
-colcon build
-source install/local_setup.bash
-ros2 run lab2 safety_node
-📝 Step 2. Publisher 노드 작성
-Python 노드를 수정한 뒤 다음 명령으로 실행합니다:
+---
 
-bash
-코드 복사
-colcon build
-ros2 run lab2 safety_node
-활성화된 노드 목록을 확인:
+## 🏁 상대 차량(Opponent)과 함께 실행하기
 
-bash
-코드 복사
-ros2 node list
-토픽 관련 정보 확인 명령어:
+상대 차량을 추가하려면 설정 파일을 수정합니다:  
+# f1tenth_gym_ros/config/sim.yaml  
+num_agent: 2  
 
-bash
-코드 복사
-ros2 topic list
-ros2 topic info /brake_bool --verbose
-ros2 topic echo /brake_bool
-📡 Step 3. Subscriber 추가
-ego_vehicle의 /scan 토픽을 **구독(subscribe)**하도록 Python 코드에 기능을 추가합니다.
-수정 후 빌드 및 재실행합니다:
+그 다음, 컨테이너 내부에서 아래 명령어 실행:  
+colcon build  
+source /opt/ros/foxy/setup.bash  
+source install/local_setup.bash  
+ros2 launch f1tenth_gym_ros gym_bridge_launch.py  
 
-bash
-코드 복사
-colcon build
-source install/local_setup.bash
-ros2 run lab2 safety_node
-⚙️ 9. 빌드 및 변경사항 적용
-Python 파일 또는 launch 파일을 수정한 후에는 반드시 아래 명령을 다시 실행해야 합니다.
+RViz에서 RobotModel을 추가하고, description을 다음과 같이 설정하면  
+상대 차량 시각화가 가능합니다:  
+/opp_robot_description
 
-bash
-코드 복사
-colcon build
-source /opt/ros/foxy/setup.bash
-source install/local_setup.bash
-📘 10. PID 제어 시뮬레이터 (참고용)
-PID 제어 파라미터 튜닝을 위한 온라인 시뮬레이터:
-👉 https://tech-uofm.info/pid/pid.html
+---
 
-🗂️ 11. 디렉토리 구조 (Directory Structure)
-아래는 기본적인 프로젝트 디렉토리 구성 예시입니다.
+## ⚙️ 코드 수정 및 빌드 반영
 
-csharp
-코드 복사
-f1tenth_gym_ros/
-├── config/
-│   ├── sim.yaml                  # 시뮬레이션 및 opponent 설정
-│   └── params.yaml               # PID 또는 환경 파라미터 (선택사항)
-│
-├── launch/
-│   ├── gym_bridge_launch.py      # ROS2 브리지 실행 파일
-│   └── gym_bridge.rviz           # RViz 텔레오퍼레이션 설정 파일
-│
-├── src/
-│   ├── f1tenth_gym_ros/          # ROS2 브리지 및 노드 코드
-│   ├── lab2/                     # (예시) AEB와 같은 추가 패키지
-│   └── ...
-│
-├── Dockerfile                    # 컨테이너 환경 정의 파일
-├── docker-compose.yml            # 멀티 컨테이너 실행 설정
-├── install/                      # colcon 빌드 결과물
-├── build/                        # colcon 빌드 캐시
-└── README.md
-✅ 12. 요약 (Summary)
-단계	명령어 / 파일	설명
-1	docker build -t f1tenth_gym_ros -f Dockerfile .	Docker 이미지 빌드
-2	docker-compose up	시뮬레이션 실행
-3	docker exec -it f1tenth_gym_ros_sim_1 /bin/bash	컨테이너 내부 진입
-4	ros2 launch f1tenth_gym_ros gym_bridge_launch.py	ROS2 브리지 실행
-5	rviz2 -d gym_bridge.rviz	키보드 조종 (텔레오퍼레이션)
-6	colcon build && source install/local_setup.bash	코드 변경사항 반영
+Python 파일을 수정하거나 새로운 패키지를 추가할 경우 항상 재빌드해야 합니다.
 
-🧠 13. 참고 사항 (Notes)
-모든 빌드 후에는 반드시 다음 명령어를 실행해야 합니다:
+### 코드 변경 반영 명령어
+colcon build  
+source /opt/ros/foxy/setup.bash  
+source install/local_setup.bash  
 
-bash
-코드 복사
-source /opt/ros/foxy/setup.bash && source install/local_setup.bash
-Python 파일 수정 후 반드시 colcon build를 다시 수행해야 합니다.
+⚠️ 매번 colcon build 이후 반드시 두 개의 source 명령어를 실행해야 변경 사항이 적용됩니다.
 
-rviz2가 실행되지 않는다면 X11 디스플레이 포워딩 설정을 확인하세요.
+---
 
-docker ps로 실행 중인 컨테이너 이름을 확인 후 docker exec 명령을 실행하세요.
+## 🚨 예시: AEB (자동 긴급 제동) 기능 추가
+
+### Step 1. 새 패키지 생성
+cd f1tenth_labs_ws  
+ros2 pkg create --build-type ament_python --node-name safety_node lab2  
+colcon build  
+source install/local_setup.bash  
+ros2 run lab2 safety_node  
+
+### Step 2. Publisher 노드 작성
+Python 코드 수정 후 아래 명령어 실행:  
+colcon build  
+ros2 run lab2 safety_node  
+
+활성화된 노드 확인:  
+ros2 node list  
+
+ROS 토픽 관련 명령어:  
+ros2 topic list  
+ros2 topic info /brake_bool --verbose  
+ros2 topic echo /brake_bool  
+
+### Step 3. Subscriber 추가
+safety_node 파일에서 ego 차량의 /scan 토픽(LiDAR 데이터)을 구독하도록 작성합니다.  
+이를 통해 주변 장애물 감지 시 /brake_bool을 발행하여 제동 기능을 수행할 수 있습니다.
+
+---
+
+## ✅ 명령어 요약표
+
+| 작업 | 명령어 / 설명 |
+|------|----------------|
+| Docker 이미지 빌드 | docker build -t f1tenth_gym_ros -f Dockerfile . |
+| 컨테이너 실행 | docker-compose up |
+| 컨테이너 접속 | docker exec -it f1tenth_gym_ros_sim_1 /bin/bash |
+| 환경 설정 | source /opt/ros/foxy/setup.bash && source install/local_setup.bash |
+| 시뮬레이션 실행 | ros2 launch f1tenth_gym_ros gym_bridge_launch.py |
+| 텔레오퍼레이션 실행 | rviz2 -d gym_bridge.rviz |
+| 코드 수정 후 빌드 | colcon build |
+
+---
+
+## 🧰 문제 해결 (Troubleshooting)
+
+1. **RViz에서 로봇 모델이 보이지 않을 때**  
+   - RViz에서 RobotModel을 추가했는지 확인  
+   - Description이 /ego_robot_description 또는 /opp_robot_description으로 설정되어 있는지 확인  
+
+2. **Topic이 구독되지 않을 때**  
+   - ros2 topic list로 활성화된 토픽 목록을 확인  
+   - source 명령어를 빼먹지 않았는지 점검  
+
+3. **colcon build 실패 시**  
+   - Python 코드 문법 오류 또는 __init__.py 누락 여부 확인  
+   - 종속 패키지가 설치되어 있는지 확인:  
+     rosdep install --from-paths src --ignore-src -r -y  
+
+4. **Docker 컨테이너 접속 오류 시**  
+   - 실행 중인 컨테이너 확인:  
+     docker ps  
+   - 컨테이너 이름이 f1tenth_gym_ros_sim_1이 맞는지 확인 후 다시 접속 시도  
+
+---
+
+## 📦 참고
+
+- ROS2 버전: **Foxy**  
+- 시뮬레이터: **F1TENTH Gym**  
+- Docker를 이용하여 환경 의존성 최소화  
+- 기능 추가 시 반드시 colcon build + source 명령어 실행 필수  
+
+---
