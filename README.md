@@ -31,7 +31,6 @@ PID 제어기 튜닝 및 시뮬레이션 참고:
 bash'''
 cd f1tenth_gym_ros/  
 docker build -t f1tenth_gym_ros -f Dockerfile .
-'''
 
 ### 2) Docker 컨테이너 실행
 docker-compose up
