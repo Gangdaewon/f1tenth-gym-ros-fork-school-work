@@ -28,9 +28,10 @@ PID 제어기 튜닝 및 시뮬레이션 참고:
 > ⚠️ Docker 및 Docker Compose가 설치되어 있어야 합니다.
 
 ### 1) Docker 이미지 빌드
-bash'''
+'''bash
 cd f1tenth_gym_ros/  
 docker build -t f1tenth_gym_ros -f Dockerfile .
+'''
 
 ### 2) Docker 컨테이너 실행
 docker-compose up
