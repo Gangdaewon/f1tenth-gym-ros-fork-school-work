@@ -11,13 +11,13 @@ from std_msgs.msg import ColorRGBA
 class GapFollow(Node):
     def __init__(self):
         super().__init__('gap_follow_node')
-       
+        
         # Topics for publishing and subscribing
         self.lidarscan_topic = '/scan'
         self.drive_topic = '/drive'
         self.best_point_marker_topic = '/best_point_marker'
         self.bubble_marker_topic = '/bubble_point_marker'
-       
+        
         # Create subscribers and publishers
         self.lidar_sub = self.create_subscription(
             LaserScan, self.lidarscan_topic, self.scan_callback, 10)
@@ -27,16 +27,16 @@ class GapFollow(Node):
             Marker, self.best_point_marker_topic, 10)
         self.bubble_marker_pub = self.create_publisher(
             Marker, self.bubble_marker_topic, 10)
-     
+      
         # Define additional variables
         self.disparity_threshold = 0.5         # 라이다 인덱스 i와 i+1의 거리차가 0.5m 이상이면 disparity로 간주
-        self.min_bubble_radius = 0.1           # Minimum bubble radius (meters)
-        self.max_bubble_radius = 0.4           # Maximum bubble radius (meters)
-        self.bubble_distance_threshold = 10.0  # Distance at which bubble is maximum size
-   
-        self.min_gap_distance = 1.5            # 라이다 값 거리가 1.5m 이하들은 버림(너무 가까워서 조향각이 안 나옴)
-        self.min_gap_size = 15                 # Gap과 Gap 사이가 라이다 인덱스 22개 이하면 버림 그 구간 무시(너무 좁음)  # 22
-       
+        self.min_bubble_radius = 0.3 #0.3          # Minimum bubble radius (meters)
+        self.max_bubble_radius = 0.6  #0.7           # Maximum bubble radius (meters)                            # 0.3
+        self.bubble_distance_threshold = 10.0   # Distance at which bubble is maximum size
+    
+        self.min_gap_distance = 1.0             # 라이다 값 거리가 1.5m 이하들은 버림(너무 가까워서 조향각이 안 나옴)   # 1.5
+        self.min_gap_size = 22                # Gap과 Gap 사이가 라이다 인덱스 22개 이하면 버림 그 구간 무시(너무 좁음) # 22
+        
         self.get_logger().info("GapFollow Node Initialized Successfully")
 
     def publish_best_point_marker(self, best_point_idx, best_point_distance, angle_min, angle_increment):
@@ -74,7 +74,7 @@ class GapFollow(Node):
 
         # Publish the Marker
         self.best_point_marker_pub.publish(marker)
-       
+        
     def publish_closest_bubble_marker(self, bubble_distance, bubble_angle):
         """Publish a visualization marker for the closest bubble point in RViz"""
         """Note: Only one bubble point is needed"""
@@ -114,7 +114,7 @@ class GapFollow(Node):
 
         # Publish the Marker
         self.bubble_marker_pub.publish(marker)
-           
+            
     def calculate_scale_factor(self, distance):
         """Calculate scale factor based on distance (0 to 1)"""
         if distance <= self.min_bubble_radius:
@@ -123,7 +123,7 @@ class GapFollow(Node):
             return 1.0
         else:
             return (distance - self.min_bubble_radius) / (self.bubble_distance_threshold - self.min_bubble_radius)
-   
+    
     def find_disparities(self, ranges, threshold):
         """Find disparities (sudden changes) in the LiDAR distance data"""
         disparities = []
@@ -132,7 +132,7 @@ class GapFollow(Node):
             if abs(diff) > threshold:
                 disparities.append(i if diff > 0 else i + 1)
         return disparities
-   
+    
     def create_safety_bubble(self, ranges, disparities, angle_min, angle_increment):
         """
         Create a safety bubble around the closest obstacle to ignore that area
@@ -175,7 +175,7 @@ class GapFollow(Node):
         self.get_logger().debug(f"Safety Bubble: Start={start_index}, End={end_index}, Index={bubble_index}")
 
         return proc_ranges, bubble_distance, bubble_angle
-   
+    
     def calculate_bubble_radius(self, bubble_distance):
         """Calculate the bubble radius based on the distance to the obstacle"""
         # Bubble radius increases when far from obstacle and decreases when close
@@ -186,7 +186,7 @@ class GapFollow(Node):
                              (self.max_bubble_radius - self.min_bubble_radius) + self.min_bubble_radius)
         bubble_radius = np.clip(bubble_radius, self.min_bubble_radius, self.max_bubble_radius)
         return bubble_radius
-   
+    
     def find_max_gap(self, proc_ranges, disparities):
         """
         Find the largest gap in the processed ranges, excluding disparity regions
@@ -212,19 +212,19 @@ class GapFollow(Node):
 
         self.get_logger().debug(f"Max gap found: Start={start_index}, End={end_index}, Size={len(max_gap)}")
         return start_index, end_index
-   
-   
+    
+    
     def scan_callback(self, data):
         """Process each LiDAR scan as per the Follow Gap algorithm & publish an AckermannDriveStamped Message"""
         ranges = np.array(data.ranges)
         # Preprocess LiDAR scan ranges                
         ranges[np.isinf(ranges)] = 30.0  # Set infinite values to a max distance
         ranges[np.isnan(ranges)] = 0.0   # Set NaN values to zero
-        angle_start = int((np.radians(-42.5) - data.angle_min) / data.angle_increment)
-        angle_end = int((np.radians(42.5) - data.angle_min) / data.angle_increment)
+        angle_start = int((np.radians(-42) - data.angle_min) / data.angle_increment)  # 35,55
+        angle_end = int((np.radians(42) - data.angle_min) / data.angle_increment)     #-35, 55
         ranges[:angle_start] = 0.0
         ranges[angle_end:] = 0.0
-       
+        
         # Find disparities
         disparities = self.find_disparities(ranges, self.disparity_threshold)
         self.get_logger().debug(f"Detected Disparities: {disparities}")    
@@ -240,8 +240,13 @@ class GapFollow(Node):
         # Find the largest valid gap
         start_index, end_index = self.find_max_gap(proc_ranges, disparities)
         if start_index is not None and end_index is not None:
-            # Find the best point (lidar index) as the middle of the gap
-            best_point = (start_index + end_index) // 2
+            # --- 수정된 부분 ---
+            # Find the best point as the FARTHEST point within the max gap
+            gap_indices = np.arange(start_index, end_index + 1)
+            gap_ranges = proc_ranges[gap_indices]
+            
+            best_point_relative_idx = np.argmax(gap_ranges)
+            best_point = gap_indices[best_point_relative_idx]
             best_point_distance = proc_ranges[best_point]
 
             # Publish the best point as a Marker
@@ -261,15 +266,15 @@ class GapFollow(Node):
             self.get_logger().info("No valid gaps available for navigation.")
             # If no valid gaps, stop the vehicle
             self.reactive_control(0.0, 0.0)
-       
-       
+        
+        
     def calculate_speed(self, steering_angle, distance):
         """Calculate the vehicle's speed based on steering angle and distance"""
-        max_speed = 6.0  # Maximum speed (m/s)  # 7.2
-        min_speed = 4.0 # Minimum speed (m/s)   # 4.5
+        max_speed = 7.2  # Maximum speed (m/s)
+        min_speed = 4.5 # Minimum speed (m/s)
 
         # Adjust speed based on steering angle (slower when steering sharply)
-        angle_speed = max_speed - abs(steering_angle * 11 ) # * 2.0
+        angle_speed = max_speed - abs(steering_angle * 7 ) # * 2.0
         angle_speed = np.clip(angle_speed, min_speed, max_speed)
 
         # Adjust speed based on distance to the best point (slower when closer)
