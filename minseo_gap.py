@@ -30,7 +30,7 @@ class GapFollow(Node):
         self.LIDAR_RANGE_CAP = 10.0
 
         # Speed logic 
-        self.max_speed = 8.0    # m/s (상황에 따라 조정)
+        self.max_speed = 8.5    # m/s (상황에 따라 조정)
         self.min_speed = 4.5     # m/s
         self.max_steer_deg = 20.0  # 물리적 조향 한계(안전 클리핑)
 
@@ -40,20 +40,17 @@ class GapFollow(Node):
         self.fine_threshold = 2.0          # fine gap: 최소 거리 임계
         self.fine_min_length = 5           # fine gap: 최소 인덱스 길이
         self.fine_min_range = 2.5          # fine gap: 길이 기반 필터
-        self.fine_min_width = 0.5          # fine gap: 실제 폭(m) 조건
-        
-        # 작은 틈 제거 파라미터 (벽면의 작은 틈을 0.0으로 치환)
-        self.min_gap_angle = 15.0          # 최소 gap 각도 (degrees)
+        self.fine_min_width = 2.0 # 0.5          # fine gap: 실제 폭(m) 조건
 
         # FOV 선택: 주행 의사결정 범위(-85~85deg), 버블 전용(-45~45deg)
-        self.deg_min = -65
-        self.deg_max = 65
+        self.deg_min = -60
+        self.deg_max = 60
         self.deg_min_bubble = -45
         self.deg_max_bubble = 45
 
         # Safety bubble 
         self.fixed_bubble_radius = 0.35  # 버블 반경(m) – 마스킹 계산용
-        self.min_bubble_radius = 0.1     # RViz 표시용 동적 반경 최소치
+        self.min_bubble_radius = 0.02     # RViz 표시용 동적 반경 최소치
         self.max_bubble_radius = 0.4     # RViz 표시용 동적 반경 최대치
         self.bubble_distance_threshold = 10.0  # 동적 표시 스케일 범위
 
@@ -66,36 +63,6 @@ class GapFollow(Node):
         arr[np.isnan(arr)] = 0.0
         arr[arr > self.LIDAR_RANGE_CAP] = self.LIDAR_RANGE_CAP
         return arr
-
-    def mask_small_gaps(self, ranges, angle_increment, min_gap_angle_deg):
-        """
-        벽면의 작은 틈을 0.0으로 치환 (gap으로 인식되지 않도록)
-        
-        Args:
-            ranges: lidar 거리 배열
-            angle_increment: 각도 증분 (radians)
-            min_gap_angle_deg: 최소 gap 각도 (degrees) - 이보다 작은 연속 구간은 0.0으로 치환
-        
-        Returns:
-            처리된 ranges 배열
-        """
-        ranges = ranges.copy()
-        min_gap_indices = int(np.radians(min_gap_angle_deg) / angle_increment)
-        
-        # 0보다 큰 구간 찾기 (유효한 거리 구간)
-        masked = np.ma.masked_where(ranges <= 0.0, ranges)
-        slices = np.ma.notmasked_contiguous(masked)
-        
-        if not slices:
-            return ranges
-        
-        # 최소 인덱스 개수보다 작은 연속 구간은 0.0으로 치환
-        for sl in slices:
-            gap_length = sl.stop - sl.start
-            if gap_length < min_gap_indices:
-                ranges[sl.start:sl.stop] = 0.0
-            
-        return ranges
 
     def find_n_extend_disparity(self, ranges, disparity_threshold, extend_num):
         # 1) disparity 찾기
@@ -226,13 +193,13 @@ class GapFollow(Node):
     # ---------- Speed / Control ----------
     def calculate_speed(self, steering_angle_rad, distance):
         # 조향 큰 경우 감속
-        angle_speed = self.max_speed - abs(steering_angle_rad * 11.0)
+        angle_speed = self.max_speed - abs(steering_angle_rad * 13.0) # 11.0)
         angle_speed = np.clip(angle_speed, self.min_speed, self.max_speed)
         # 베스트 포인트까지 거리 기반 보정
-        if distance > 4.0:
-            dist_speed = max(self.max_speed, distance / 0.95)
+        if distance > 3.0: # 4.0:
+            dist_speed = max(self.max_speed, distance / 0.95) # 0.95
         else:
-            dist_speed = min(self.max_speed * 1.5, distance / 0.95)
+            dist_speed = min(self.max_speed * 1.5, distance / 0.95) # 1.5
         return float(min(angle_speed, dist_speed))
 
     def publish_drive(self, steering_angle_rad, speed):
@@ -267,9 +234,6 @@ class GapFollow(Node):
         # 전처리
         proc = self.preprocess_lidar(ranges_full[min_idx:max_idx])
         proc_bub = self.preprocess_lidar(ranges_full[min_idx_bub:max_idx_bub])
-
-        # **작은 틈 마스킹 (0.0으로 치환)**
-        proc = self.mask_small_gaps(proc, data.angle_increment, self.min_gap_angle)
 
         # 디스패리티 확장
         proc = self.find_n_extend_disparity(proc, self.disparity_threshold, self.extend_num)
