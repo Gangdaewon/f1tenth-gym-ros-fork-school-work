@@ -156,12 +156,23 @@ class GapFollow(Node):
         return (opt[0], opt[-1]) if opt else (None, None)
 
     def find_best_point_avg(self, start_idx, end_idx, ranges, window_size=20):
+        """
+        Gap 내에서 이동 평균 최대값 찾기 (중앙 선호 가중치 추가)
+        """
         sub = ranges[start_idx:end_idx]
         if len(sub) == 0:
             return (start_idx + end_idx) // 2
+        
+        # 이동 평균으로 스무딩
         kernel = np.ones(window_size) / window_size
         smoothed = np.convolve(sub, kernel, mode='same')
-        return smoothed.argmax() + start_idx
+        
+        # 중앙 선호 가중치 추가 (직선 주행 안정화)
+        center_idx = len(smoothed) // 2
+        center_bias = np.exp(-0.01 * np.abs(np.arange(len(smoothed)) - center_idx))
+        weighted = smoothed * center_bias
+        
+        return weighted.argmax() + start_idx
 
     def calculate_scale_factor(self, distance):
         # RViz 마커 크기 스케일
@@ -246,9 +257,19 @@ class GapFollow(Node):
         ranges_full[:min_idx] = 0.0
         ranges_full[max_idx:] = 0.0
 
-        # 전처리
+        # 전처리 (inf → 30.0, nan → 0.0, 작은 틈 제거)
         proc = self.preprocess_lidar(ranges_full[min_idx:max_idx])
         proc_bub = self.preprocess_lidar(ranges_full[min_idx_bub:max_idx_bub])
+
+        # **직선 구간 확인 (±15도) - 전처리 후 확인**
+        straight_min_idx = deg_to_idx(-15) - min_idx  # proc 배열 기준 인덱스
+        straight_max_idx = deg_to_idx(15) - min_idx
+        straight_section = proc[straight_min_idx:straight_max_idx]
+        
+        # 30.0 (LIDAR_RANGE_CAP * 3) 값만 있는지 확인
+        # 0.0이 아닌 유효값이 모두 30.0인지 체크
+        valid_vals = straight_section[straight_section > 0.0]
+        is_straight_clear = len(valid_vals) > 0 and np.all(np.isclose(valid_vals, self.LIDAR_RANGE_CAP * 3))
 
         # 디스패리티 확장
         proc = self.find_n_extend_disparity(proc, self.disparity_threshold, self.extend_num)
@@ -269,11 +290,19 @@ class GapFollow(Node):
         start_f, end_f = self.find_fine_gap(proc, self.fine_threshold, self.fine_min_length,
                                             self.fine_min_range, self.fine_min_width, data.angle_increment)
 
-        # 베스트 포인트 결정: fine 우선, 없으면 평균 윈도우 최대
-        if start_f is not None and end_f is not None:
-            best_idx_local = (start_f + end_f) // 2
+        # **베스트 포인트 결정: 직선 구간이 열려있으면 normalize 적용**
+        if is_straight_clear:
+            # 직선 구간이 30.0만 있음 → normalize 적용 (중앙 선호)
+            if start_f is not None and end_f is not None:
+                best_idx_local = self.find_best_point_avg(start_f, end_f, proc, window_size=30)
+            else:
+                best_idx_local = self.find_best_point_avg(start_m, end_m, proc, window_size=20)
         else:
-            best_idx_local = self.find_best_point_avg(start_m, end_m, proc, window_size=20)
+            # 직선 구간에 장애물 있음 → 원본 로직 (단순 중앙값)
+            if start_f is not None and end_f is not None:
+                best_idx_local = (start_f + end_f) // 2
+            else:
+                best_idx_local = (start_m + end_m) // 2
 
         # 전역 인덱스 & 각도
         best_idx_global = best_idx_local + min_idx
@@ -284,7 +313,7 @@ class GapFollow(Node):
         self.publish_best_point_marker(best_idx_global, best_dist, data.angle_min, data.angle_increment)
         self.publish_bubble_marker(closest_idx_bub_local + min_idx_bub, closest_dist_bub, data.angle_min, data.angle_increment)
 
-        # 속도 계산 (2번)
+        # 속도 계산
         speed = self.calculate_speed(best_angle, best_dist)
         self.publish_drive(best_angle, speed)
 
