@@ -41,6 +41,7 @@ class GapFollow(Node):
         self.fine_min_length = 5           # fine gap: 최소 인덱스 길이
         self.fine_min_range = 2.5          # fine gap: 길이 기반 필터
         self.fine_min_width = 2.0 # 0.5          # fine gap: 실제 폭(m) 조건
+        self.min_consecutive = 20
 
         # FOV 선택: 주행 의사결정 범위(-85~85deg), 버블 전용(-45~45deg)
         self.deg_min = -60
@@ -62,6 +63,20 @@ class GapFollow(Node):
         arr[np.isinf(arr)] = self.LIDAR_RANGE_CAP * 3  # 먼 곳은 크게
         arr[np.isnan(arr)] = 0.0
         arr[arr > self.LIDAR_RANGE_CAP] = self.LIDAR_RANGE_CAP
+        i = 0
+        while i < len(arr):
+            if arr[i] > 0.0:  # 유효한 값 시작
+                start = i
+                count = 0
+                # 연속된 유효 값 개수 세기
+                while i < len(arr) and arr[i] > 0.0:
+                    count += 1
+                    i += 1
+                # 20개 미만이면 0.0으로 치환
+                if count < self.min_consecutive:
+                    arr[start:start + count] = 0.0
+            else:
+                i += 1
         return arr
 
     def find_n_extend_disparity(self, ranges, disparity_threshold, extend_num):
