@@ -46,8 +46,8 @@ class GapFollow(Node):
         self.min_gap_angle = 15.0          # 최소 gap 각도 (degrees)
 
         # FOV 선택: 주행 의사결정 범위(-85~85deg), 버블 전용(-45~45deg)
-        self.deg_min = -85
-        self.deg_max = 85
+        self.deg_min = -65
+        self.deg_max = 65
         self.deg_min_bubble = -45
         self.deg_max_bubble = 45
 
