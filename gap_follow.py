@@ -32,10 +32,10 @@ class GapFollow(Node):
         self.disparity_threshold = 0.5         # 라이다 인덱스 i와 i+1의 거리차가 0.5m 이상이면 disparity로 간주
         
         # Multi-bubble parameters (레이싱 최적화)
-        self.bubble_creation_distance = 3.0    # 이 거리 이내 모든 장애물에 버블 생성 (meters)
-        self.min_bubble_radius = 0.1          # Minimum bubble radius (meters) - 증가
-        self.max_bubble_radius = 0.4           # Maximum bubble radius (meters) - 증가
-        self.bubble_distance_threshold = 5.0  # Distance at which bubble is maximum size
+        self.bubble_creation_distance = 4.0    # 이 거리 이내 모든 장애물에 버블 생성 (meters)
+        self.min_bubble_radius = 0.25          # Minimum bubble radius (meters) - 증가
+        self.max_bubble_radius = 0.8           # Maximum bubble radius (meters) - 증가
+        self.bubble_distance_threshold = 10.0  # Distance at which bubble is maximum size
         self.speed_bubble_factor = 0.5         # 속도에 따른 버블 크기 증가 계수
         
         # Gap finding parameters
@@ -46,6 +46,7 @@ class GapFollow(Node):
         self.prev_steering_angle = 0.0         # 이전 조향각 (스무딩용)
         self.steering_smoothing_factor = 0.3   # 조향각 스무딩 계수 (0=최대 스무딩, 1=스무딩 없음)
         self.max_steering_rate = 0.5           # 최대 조향 각속도 (rad/iteration)
+        self.steering_deadzone = 0.05          # 조향 불감대 (rad, 약 2.9도) - 직진 안정성
         
         # Speed control parameters (강건한 속도 제어)
         self.max_speed = 6.0                   # 최대 속도 (m/s)
@@ -279,6 +280,40 @@ class GapFollow(Node):
 
         self.get_logger().debug(f"Max gap found: Start={start_index}, End={end_index}, Size={len(max_gap)}")
         return start_index, end_index
+    
+    def find_weighted_best_point(self, proc_ranges, start_index, end_index):
+        """
+        Find best point using distance-weighted average
+        - Reduces sensitivity to gap boundary fluctuations
+        - Prefers farther (safer) points
+        - More stable in straight sections
+        """
+        gap_indices = np.arange(start_index, end_index + 1)
+        gap_ranges = proc_ranges[start_index:end_index + 1]
+        
+        # Filter out zero or very close ranges
+        valid_mask = gap_ranges > self.min_gap_distance
+        if not np.any(valid_mask):
+            # Fallback to simple center
+            return (start_index + end_index) // 2
+        
+        valid_indices = gap_indices[valid_mask]
+        valid_ranges = gap_ranges[valid_mask]
+        
+        # Weight by distance squared (farther points heavily preferred)
+        weights = valid_ranges ** 2
+        
+        # Weighted average
+        if np.sum(weights) > 0:
+            weighted_center = np.sum(valid_indices * weights) / np.sum(weights)
+            best_point = int(np.round(weighted_center))
+        else:
+            best_point = (start_index + end_index) // 2
+        
+        # Ensure best_point is within gap range
+        best_point = np.clip(best_point, start_index, end_index)
+        
+        return best_point
    
    
     def scan_callback(self, data):
@@ -311,8 +346,8 @@ class GapFollow(Node):
             # Calculate gap size for speed control
             gap_size = end_index - start_index + 1
             
-            # Find the best point (lidar index) as the middle of the gap
-            best_point = (start_index + end_index) // 2
+            # Find the best point using weighted average (더 안정적)
+            best_point = self.find_weighted_best_point(proc_ranges, start_index, end_index)
             best_point_distance = proc_ranges[best_point]
 
             # Publish the best point as a Marker
@@ -322,8 +357,8 @@ class GapFollow(Node):
             # Calculate the steering angle towards the best point
             best_point_angle = data.angle_min + best_point * data.angle_increment
             
-            # Apply steering smoothing for stable control
-            smoothed_steering_angle = self.apply_steering_smoothing(best_point_angle)
+            # Apply adaptive steering smoothing with dead zone (직진 안정성 향상)
+            smoothed_steering_angle = self.apply_adaptive_steering_smoothing(best_point_angle)
 
             # Calculate robust speed based on multiple factors
             speed = self.calculate_robust_speed(
@@ -336,9 +371,10 @@ class GapFollow(Node):
             self.reactive_control(smoothed_steering_angle, speed)
             
             self.get_logger().debug(
-                f"Gap size: {gap_size}, Best point dist: {best_point_distance:.2f}m, "
-                f"Raw angle: {np.degrees(best_point_angle):.1f}°, "
-                f"Smoothed angle: {np.degrees(smoothed_steering_angle):.1f}°, "
+                f"Gap: [{start_index},{end_index}] size={gap_size}, "
+                f"Best pt: {best_point}, dist={best_point_distance:.2f}m, "
+                f"Raw: {np.degrees(best_point_angle):.2f}°, "
+                f"Smoothed: {np.degrees(smoothed_steering_angle):.2f}°, "
                 f"Speed: {speed:.2f}m/s"
             )
         else:
@@ -373,6 +409,7 @@ class GapFollow(Node):
         Apply exponential smoothing to steering angle to reduce oscillations
         - Prevents sudden steering changes
         - Maintains responsiveness for safety
+        - Now replaced by adaptive version below (kept for compatibility)
         """
         # Exponential moving average
         smoothed_angle = (self.steering_smoothing_factor * target_steering_angle + 
@@ -384,6 +421,44 @@ class GapFollow(Node):
             smoothed_angle = self.prev_steering_angle + np.sign(angle_diff) * self.max_steering_rate
         
         # Update previous value
+        self.prev_steering_angle = smoothed_angle
+        
+        return smoothed_angle
+    
+    def apply_adaptive_steering_smoothing(self, target_steering_angle):
+        """
+        Apply adaptive smoothing with dead zone for straight sections
+        - Dead zone: eliminates micro-corrections in straight driving
+        - Adaptive smoothing: strong in straights, weak in curves
+        - Rate limiting: prevents physically impossible steering changes
+        """
+        # 1. Apply dead zone (불감대)
+        # If steering is very small, force it to zero to prevent oscillations
+        if abs(target_steering_angle) < self.steering_deadzone:
+            target_steering_angle = 0.0
+        
+        # 2. Adaptive smoothing factor based on steering magnitude
+        abs_angle = abs(target_steering_angle)
+        
+        if abs_angle < 0.1:  # Nearly straight (< 5.7°)
+            smoothing_factor = 0.15  # Very strong smoothing
+        elif abs_angle < 0.3:  # Gentle curve (< 17°)
+            smoothing_factor = 0.25  # Strong smoothing
+        elif abs_angle < 0.5:  # Moderate curve (< 29°)
+            smoothing_factor = 0.35  # Medium smoothing
+        else:  # Sharp turn (> 29°)
+            smoothing_factor = 0.5   # Weak smoothing (need responsiveness)
+        
+        # 3. Exponential moving average with adaptive factor
+        smoothed_angle = (smoothing_factor * target_steering_angle + 
+                         (1.0 - smoothing_factor) * self.prev_steering_angle)
+        
+        # 4. Apply steering rate limit (angular velocity constraint)
+        angle_diff = smoothed_angle - self.prev_steering_angle
+        if abs(angle_diff) > self.max_steering_rate:
+            smoothed_angle = self.prev_steering_angle + np.sign(angle_diff) * self.max_steering_rate
+        
+        # 5. Update previous value
         self.prev_steering_angle = smoothed_angle
         
         return smoothed_angle
