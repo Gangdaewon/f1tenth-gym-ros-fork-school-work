@@ -42,8 +42,8 @@ class GapFollow(Node):
         self.fine_min_range = 2.5          # fine gap: 길이 기반 필터
         self.fine_min_width = 0.5          # fine gap: 실제 폭(m) 조건
         
-        # Gap 최소 각도 범위 (작은 틈 제거용)
-        self.min_gap_angle = 15.0          # 최소 gap 각도 (degrees) - 이보다 작은 gap은 무시
+        # 작은 틈 제거 파라미터 (벽면의 작은 틈을 disparity로 변환)
+        self.min_gap_angle = 15.0          # 최소 gap 각도 (degrees) - 이보다 작으면 틈을 메움
 
         # FOV 선택: 주행 의사결정 범위(-65~65deg), 버블 전용(-45~45deg)
         self.deg_min = -65
@@ -67,6 +67,61 @@ class GapFollow(Node):
         arr[arr > self.LIDAR_RANGE_CAP] = self.LIDAR_RANGE_CAP
         return arr
 
+    def close_small_gaps(self, ranges, angle_increment, min_gap_angle_deg):
+        """
+        벽면의 작은 틈을 disparity로 변환 (틈을 주변 벽 거리로 채움)
+        
+        Args:
+            ranges: lidar 거리 배열
+            angle_increment: 각도 증분 (radians)
+            min_gap_angle_deg: 최소 gap 각도 (degrees) - 이보다 작은 틈은 메움
+        
+        Returns:
+            처리된 ranges 배열 (작은 틈이 주변 벽 값으로 채워짐)
+        """
+        ranges = ranges.copy()
+        min_gap_indices = int(np.radians(min_gap_angle_deg) / angle_increment)
+        
+        # 0보다 큰 구간 찾기 (유효한 거리 구간)
+        masked = np.ma.masked_where(ranges <= 0.0, ranges)
+        slices = np.ma.notmasked_contiguous(masked)
+        
+        if not slices:
+            return ranges
+        
+        # 최소 각도보다 작은 gap은 양쪽 벽의 최소값으로 채움
+        for sl in slices:
+            gap_length = sl.stop - sl.start
+            
+            # 작은 틈인 경우
+            if gap_length < min_gap_indices:
+                # 양쪽 벽 거리 구하기
+                left_wall_dist = 0.0
+                right_wall_dist = 0.0
+                
+                # 왼쪽 벽 찾기
+                if sl.start > 0:
+                    left_wall_dist = ranges[sl.start - 1]
+                
+                # 오른쪽 벽 찾기
+                if sl.stop < len(ranges):
+                    right_wall_dist = ranges[sl.stop]
+                
+                # 양쪽 벽 중 더 가까운 거리로 틈을 채움 (보수적)
+                if left_wall_dist > 0.0 and right_wall_dist > 0.0:
+                    fill_value = min(left_wall_dist, right_wall_dist)
+                elif left_wall_dist > 0.0:
+                    fill_value = left_wall_dist
+                elif right_wall_dist > 0.0:
+                    fill_value = right_wall_dist
+                else:
+                    continue  # 양쪽 모두 없으면 스킵
+                
+                # 틈을 벽 거리로 채움
+                ranges[sl.start:sl.stop] = fill_value
+                
+        return ranges
+
     def find_n_extend_disparity(self, ranges, disparity_threshold, extend_num):
         # 1) disparity 찾기
         ranges = ranges.copy()
@@ -88,36 +143,6 @@ class GapFollow(Node):
                     k = index - j - 1
                     if k >= 0:
                         ranges[k] = base
-        return ranges
-
-    def filter_small_gaps(self, ranges, angle_increment, min_gap_angle_deg):
-        """
-        너무 작은 각도 범위의 연속적인 gap을 제거 (벽의 작은 틈 무시)
-        
-        Args:
-            ranges: lidar 거리 배열
-            angle_increment: 각도 증분 (radians)
-            min_gap_angle_deg: 최소 gap 각도 (degrees)
-        
-        Returns:
-            필터링된 ranges 배열
-        """
-        ranges = ranges.copy()
-        min_gap_indices = int(np.radians(min_gap_angle_deg) / angle_increment)
-        
-        # 0보다 큰 구간 찾기
-        masked = np.ma.masked_where(ranges <= 0.0, ranges)
-        slices = np.ma.notmasked_contiguous(masked)
-        
-        if not slices:
-            return ranges
-        
-        # 최소 인덱스 개수보다 작은 gap은 0으로 마스킹
-        for sl in slices:
-            gap_length = sl.stop - sl.start
-            if gap_length < min_gap_indices:
-                ranges[sl.start:sl.stop] = 0.0
-                
         return ranges
 
     def set_safety_bubble(self, closest_idx, proc_ranges, angle_increment, closest_dist):
@@ -268,11 +293,11 @@ class GapFollow(Node):
         proc = self.preprocess_lidar(ranges_full[min_idx:max_idx])
         proc_bub = self.preprocess_lidar(ranges_full[min_idx_bub:max_idx_bub])
 
-        # 디스패리티 확장
+        # **1단계: 작은 틈 제거 (벽면 틈을 disparity로 변환)**
+        proc = self.close_small_gaps(proc, data.angle_increment, self.min_gap_angle)
+
+        # **2단계: 기존 디스패리티 확장**
         proc = self.find_n_extend_disparity(proc, self.disparity_threshold, self.extend_num)
-        
-        # **작은 gap 필터링 (벽의 작은 틈 제거)**
-        proc = self.filter_small_gaps(proc, data.angle_increment, self.min_gap_angle)
 
         # 가장 가까운 점 (버블 기준은 중앙 좁은 FOV에서)
         if len(proc) == 0 or len(proc_bub) == 0:
@@ -287,12 +312,12 @@ class GapFollow(Node):
 
         # 최대 갭 + fine gap 
         start_m, end_m = self.find_max_gap(proc)
-        start_f, end_f = self.find_fine_gap(proc, self.fine_threshold, self.fine_min_length, 
+        start_f, end_f = self.find_fine_gap(proc, self.fine_threshold, self.fine_min_length,
                                             self.fine_min_range, self.fine_min_width, data.angle_increment)
-        
+
         # 베스트 포인트 결정: fine 우선, 없으면 평균 윈도우 최대
         if start_f is not None and end_f is not None:
-            best_idx_local = self.find_best_point_avg(start_f, end_f, proc, window_size=20)
+            best_idx_local = (start_f + end_f) // 2
         else:
             best_idx_local = self.find_best_point_avg(start_m, end_m, proc, window_size=20)
 
@@ -301,15 +326,12 @@ class GapFollow(Node):
         best_angle = data.angle_min + best_idx_global * data.angle_increment
         best_dist = float(proc[best_idx_local]) if 0 <= best_idx_local < len(proc) else 0.0
 
+        # RViz 마커
+        self.publish_best_point_marker(best_idx_global, best_dist, data.angle_min, data.angle_increment)
+        self.publish_bubble_marker(closest_idx_bub_local + min_idx_bub, closest_dist_bub, data.angle_min, data.angle_increment)
+
         # 속도 계산
         speed = self.calculate_speed(best_angle, best_dist)
-
-        # RViz 마커
-        self.publish_bubble_marker(closest_idx_bub_local + min_idx_bub, closest_dist_bub, 
-                                   data.angle_min, data.angle_increment)
-        self.publish_best_point_marker(best_idx_global, best_dist, data.angle_min, data.angle_increment)
-        
-        # 주행 명령
         self.publish_drive(best_angle, speed)
 
 
