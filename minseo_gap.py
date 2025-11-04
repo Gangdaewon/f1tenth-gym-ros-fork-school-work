@@ -1,8 +1,10 @@
+
+
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
-
 import numpy as np
+
 from sensor_msgs.msg import LaserScan
 from ackermann_msgs.msg import AckermannDriveStamped
 from visualization_msgs.msg import Marker
@@ -20,298 +22,268 @@ class GapFollow(Node):
         self.bubble_marker_topic = '/bubble_point_marker'
 
         # Pub/Sub
-        self.lidar_sub = self.create_subscription(
-            LaserScan, self.lidarscan_topic, self.scan_callback, 10)
-        self.drive_pub = self.create_publisher(
-            AckermannDriveStamped, self.drive_topic, 10)
-        self.best_point_marker_pub = self.create_publisher(
-            Marker, self.best_point_marker_topic, 10)
-        self.bubble_marker_pub = self.create_publisher(
-            Marker, self.bubble_marker_topic, 10)
+        self.lidar_sub = self.create_subscription(LaserScan, self.lidarscan_topic, self.lidar_callback, 10)
+        self.drive_pub = self.create_publisher(AckermannDriveStamped, self.drive_topic, 10)
+        self.best_point_marker_pub = self.create_publisher(Marker, self.best_point_marker_topic, 10)
+        self.bubble_marker_pub = self.create_publisher(Marker, self.bubble_marker_topic, 10)
 
-        # ---------------- Params (튜닝 포인트) ----------------
-        self.disparity_threshold = 0.5            # 인접 빔 거리차
-        self.min_bubble_radius = 0.30             # 버블 반경 하한 (m)
-        self.max_bubble_radius = 0.60             # 버블 반경 상한 (m)
-        self.bubble_distance_threshold = 10.0     # 멀수록 큰 버블
+        # Constants
+        self.PI = 3.1415927
+        self.LIDAR_RANGE_CAP = 10.0
 
-        self.min_gap_distance = 0.9               # gap 후보 최소거리 (m) (기존 1.0→0.9로 약간 완화)
-        self.min_gap_size = 18                    # gap 최소 길이(인덱스) (기존 22→18로 완화)
+        # Speed logic 
+        self.max_speed = 8.0    # m/s (상황에 따라 조정)
+        self.min_speed = 4.5     # m/s
+        self.max_steer_deg = 20.0  # 물리적 조향 한계(안전 클리핑)
 
-        self.lidar_cap = 30.0                     # Inf 대체 상한
-        self.fov_deg_min = -42.0                  # 사용 FOV (도)
-        self.fov_deg_max =  42.0
+        # Gap/Disparity/Fine-gap parameters 
+        self.disparity_threshold = 2.5     # 디스패리티 탐지 임계
+        self.extend_num = 1                # 디스패리티 확장 폭
+        self.fine_threshold = 2.0          # fine gap: 최소 거리 임계
+        self.fine_min_length = 5           # fine gap: 최소 인덱스 길이
+        self.fine_min_range = 2.5          # fine gap: 길이 기반 필터
+        self.fine_min_width = 0.5          # fine gap: 실제 폭(m) 조건
 
-        # 속도/조향 제한 + 스무딩
-        self.max_speed = 7.2
-        self.min_speed = 4.0
-        self.max_steer_deg = 20.0                 # 조향 제한
-        self.angle_gain_speed = 2.0               # 각도에 따른 감속량
-        self.alpha_v = 0.5                        # 속도 EMA
-        self.alpha_s = 0.5                        # 조향 EMA
-        self.max_dv = 0.6                         # 사이클당 속도 변화 제한 (m/s)
-        self.max_ds_deg = 6.0                     # 사이클당 조향 변화 제한 (deg)
+        # FOV 선택: 주행 의사결정 범위(-85~85deg), 버블 전용(-45~45deg)
+        self.deg_min = -85
+        self.deg_max = 85
+        self.deg_min_bubble = -45
+        self.deg_max_bubble = 45
 
-        # State
-        self.prev_speed = 0.0
-        self.prev_steer = 0.0
+        # Safety bubble 
+        self.fixed_bubble_radius = 0.35  # 버블 반경(m) – 마스킹 계산용
+        self.min_bubble_radius = 0.1     # RViz 표시용 동적 반경 최소치
+        self.max_bubble_radius = 0.4     # RViz 표시용 동적 반경 최대치
+        self.bubble_distance_threshold = 10.0  # 동적 표시 스케일 범위
 
-        self.get_logger().info("GapFollow Node Initialized Successfully")
+        self.get_logger().info("Merged GapFollow Node Initialized")
 
-    # ---------------- Marker ----------------
-    def publish_best_point_marker(self, best_point_idx, best_point_distance, angle_min, angle_increment):
-        angle = angle_min + best_point_idx * angle_increment
-        x = best_point_distance * np.cos(angle)
-        y = best_point_distance * np.sin(angle)
+    # ---------- Utilities ----------
+    def preprocess_lidar(self, arr):
+        arr = arr.copy()
+        arr[np.isinf(arr)] = self.LIDAR_RANGE_CAP * 3  # 먼 곳은 크게
+        arr[np.isnan(arr)] = 0.0
+        arr[arr > self.LIDAR_RANGE_CAP] = self.LIDAR_RANGE_CAP
+        return arr
 
-        marker = Marker()
-        marker.header.frame_id = "ego_racecar/laser"
-        marker.header.stamp = self.get_clock().now().to_msg()
-        marker.ns = "best_point"
-        marker.id = 0
-        marker.type = Marker.SPHERE
-        marker.action = Marker.ADD
-        marker.pose.position.x = float(x)
-        marker.pose.position.y = float(y)
-        marker.pose.position.z = 0.0
-        marker.pose.orientation.w = 1.0
-        marker.scale.x = marker.scale.y = marker.scale.z = 0.3
-        marker.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)
-        self.best_point_marker_pub.publish(marker)
+    def find_n_extend_disparity(self, ranges, disparity_threshold, extend_num):
+        # 1) disparity 찾기
+        ranges = ranges.copy()
+        disps = []
+        for i in range(1, len(ranges)):
+            if abs(ranges[i] - ranges[i - 1]) > disparity_threshold:
+                disps.append((i, ranges[i]))
+        # 2) 확장
+        for index, _ in disps:
+            if ranges[index] > ranges[index - 1]:
+                base = ranges[index - 1]
+                for j in range(extend_num):
+                    k = index + j
+                    if k < len(ranges):
+                        ranges[k] = base
+            else:
+                base = ranges[index]
+                for j in range(extend_num):
+                    k = index - j - 1
+                    if k >= 0:
+                        ranges[k] = base
+        return ranges
 
-    def publish_closest_bubble_marker(self, bubble_distance, bubble_angle):
-        x = bubble_distance * np.cos(bubble_angle)
-        y = bubble_distance * np.sin(bubble_angle)
+    def set_safety_bubble(self, closest_idx, proc_ranges, angle_increment, closest_dist):
+        # 고정 반경을 각도로 변환해 마스킹
+        if closest_dist <= 0.0:
+            return proc_ranges
+        bubble_angle = 2 * np.arctan(self.fixed_bubble_radius / (2 * max(closest_dist, 1e-3)))
+        bubble_index = max(1, int(bubble_angle / angle_increment))
+        s = max(0, closest_idx - bubble_index)
+        e = min(len(proc_ranges) - 1, closest_idx + bubble_index)
+        proc_ranges[s:e + 1] = 0.0
+        return proc_ranges
 
-        # 거리 기반 동적 반경
-        scale_factor = self.calculate_scale_factor(bubble_distance)
-        dynamic_bubble_radius = self.min_bubble_radius + \
-            (self.max_bubble_radius - self.min_bubble_radius) * scale_factor
+    def find_max_gap(self, ranges):
+        masked = np.ma.masked_where(ranges <= 0.0, ranges)
+        slices = np.ma.notmasked_contiguous(masked)
+        if not slices:
+            return 0, len(ranges) - 1
+        largest = max(slices, key=lambda sl: sl.stop - sl.start)
+        return largest.start, largest.stop
 
-        marker = Marker()
-        marker.header.frame_id = "ego_racecar/laser"
-        marker.header.stamp = self.get_clock().now().to_msg()
-        marker.ns = "bubble_point"
-        marker.id = 0
-        marker.type = Marker.SPHERE
-        marker.action = Marker.ADD
-        marker.pose.position.x = float(x)
-        marker.pose.position.y = float(y)
-        marker.pose.position.z = 0.0
-        marker.pose.orientation.w = 1.0
-        marker.scale.x = marker.scale.y = marker.scale.z = dynamic_bubble_radius * 2.0
-        marker.color = ColorRGBA(r=0.0, g=0.0, b=1.0, a=0.5)
-        self.bubble_marker_pub.publish(marker)
+    def find_fine_gap(self, ranges, threshold, min_length, min_range, min_width, angle_increment):
+        gaps, s, cnt = [], None, 0
+        for i in range(len(ranges)):
+            if ranges[i] > threshold:
+                if s is None:
+                    s = i
+                cnt += 1
+            else:
+                if cnt >= min_length:
+                    gaps.append(list(range(s, i)))
+                s, cnt = None, 0
+        if cnt >= min_length:
+            gaps.append(list(range(s, len(ranges))))
+        if not gaps:
+            return None, None
 
-    # ---------------- Helpers ----------------
+        valid = []
+        for g in gaps:
+            g_s, g_e = g[0], g[-1]
+            r1, r2 = ranges[g_s], ranges[g_e]
+            theta = (g_e - g_s) * angle_increment
+            gap_width = np.sqrt(r1**2 + r2**2 - 2*r1*r2*np.cos(theta))
+            if gap_width >= min_width:
+                valid.append(g)
+        if not valid:
+            return None, None
+
+        long_gaps = [g for g in valid if len(g) >= min_range]
+        if not long_gaps:
+            opt = max(valid, key=lambda g: len(g))
+        else:
+            opt = max(long_gaps, key=lambda g: max(ranges[idx] for idx in g))
+        return (opt[0], opt[-1]) if opt else (None, None)
+
+    def find_best_point_avg(self, start_idx, end_idx, ranges, window_size=20):
+        sub = ranges[start_idx:end_idx]
+        if len(sub) == 0:
+            return (start_idx + end_idx) // 2
+        kernel = np.ones(window_size) / window_size
+        smoothed = np.convolve(sub, kernel, mode='same')
+        return smoothed.argmax() + start_idx
+
     def calculate_scale_factor(self, distance):
-        """0~1 스케일: 가까울수록 작게, 멀수록 크게"""
+        # RViz 마커 크기 스케일
         if distance <= self.min_bubble_radius:
             return 0.0
         if distance >= self.bubble_distance_threshold:
             return 1.0
         return (distance - self.min_bubble_radius) / (self.bubble_distance_threshold - self.min_bubble_radius)
 
-    def get_angle(self, index, angle_min, angle_increment):
-        return angle_min + index * angle_increment
+    # ---------- Markers ----------
+    def publish_best_point_marker(self, best_idx, best_dist, angle_min, angle_increment):
+        ang = angle_min + best_idx * angle_increment
+        x = best_dist * np.cos(ang)
+        y = best_dist * np.sin(ang)
+        m = Marker()
+        m.header.frame_id = "ego_racecar/laser"
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.ns = "best_point"; m.id = 0
+        m.type = Marker.SPHERE; m.action = Marker.ADD
+        m.pose.position.x = x; m.pose.position.y = y; m.pose.position.z = 0.0
+        m.pose.orientation.w = 1.0
+        m.scale.x = m.scale.y = m.scale.z = 0.3
+        m.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)
+        self.best_point_marker_pub.publish(m)
 
-    def _fov_indices(self, data, deg_min, deg_max):
-        n = len(data.ranges)
-        i0 = int((np.radians(deg_min) - data.angle_min) / data.angle_increment)
-        i1 = int((np.radians(deg_max) - data.angle_min) / data.angle_increment)
-        i0 = max(0, min(n - 1, i0))
-        i1 = max(0, min(n - 1, i1))
-        if i0 > i1:
-            i0, i1 = i1, i0
-        return i0, i1
+    def publish_bubble_marker(self, idx, dist, angle_min, angle_increment):
+        ang = angle_min + idx * angle_increment
+        x = dist * np.cos(ang)
+        y = dist * np.sin(ang)
+        # 표시용 동적 반경
+        scale = self.calculate_scale_factor(dist)
+        dyn_r = self.min_bubble_radius + (self.max_bubble_radius - self.min_bubble_radius) * scale
+        m = Marker()
+        m.header.frame_id = "ego_racecar/laser"
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.ns = "bubble_point"; m.id = 0
+        m.type = Marker.SPHERE; m.action = Marker.ADD
+        m.pose.position.x = x; m.pose.position.y = y; m.pose.position.z = 0.0
+        m.pose.orientation.w = 1.0
+        m.scale.x = m.scale.y = m.scale.z = dyn_r * 2.0
+        m.color = ColorRGBA(r=0.0, g=0.0, b=1.0, a=0.5)
+        self.bubble_marker_pub.publish(m)
 
-    # ---------------- Disparity / Bubble / Gap ----------------
-    def find_disparities_valid(self, ranges, threshold, start_idx, end_idx):
-        """무시구간(0.0) 제외하고 유효 FOV에서만 disparity 계산"""
-        disparities = []
-        for i in range(max(start_idx, 0), min(end_idx, len(ranges) - 2) + 1):
-            a, b = ranges[i], ranges[i + 1]
-            if a == 0.0 or b == 0.0:
-                continue
-            if abs(b - a) > threshold:
-                disparities.append(i if (b - a) > 0 else i + 1)
-        return disparities
-
-    def create_safety_bubble(self, ranges, disparities, angle_min, angle_increment):
-        """가장 가까운 disparity 지점을 중심으로 버블 1개 생성"""
-        proc_ranges = ranges.copy()
-        if not disparities:
-            return proc_ranges, None, None
-
-        valid_disparities = [i for i in disparities if ranges[i] > 0.0]
-        if not valid_disparities:
-            return proc_ranges, None, None
-
-        bubble_index = min(valid_disparities, key=lambda i: ranges[i])
-        bubble_distance = ranges[bubble_index]
-        bubble_angle = self.get_angle(bubble_index, angle_min, angle_increment)
-
-        # 거리 기반 반경
-        bubble_radius = self.calculate_bubble_radius(bubble_distance)
-
-        # 각도 스프레드
-        if bubble_distance > self.min_bubble_radius:
-            theta = 2.0 * np.arcsin(min(1.0, bubble_radius / max(bubble_distance, 1e-6)))
+    # ---------- Speed / Control ----------
+    def calculate_speed(self, steering_angle_rad, distance):
+        # 조향 큰 경우 감속
+        angle_speed = self.max_speed - abs(steering_angle_rad * 11.0)
+        angle_speed = np.clip(angle_speed, self.min_speed, self.max_speed)
+        # 베스트 포인트까지 거리 기반 보정
+        if distance > 4.0:
+            dist_speed = max(self.max_speed, distance / 0.95)
         else:
-            theta = np.pi
-        bubble_size = int(theta / angle_increment / 2.0)
+            dist_speed = min(self.max_speed * 1.5, distance / 0.95)
+        return float(min(angle_speed, dist_speed))
 
-        s = max(0, bubble_index - bubble_size)
-        e = min(len(ranges) - 1, bubble_index + bubble_size)
-        proc_ranges[s:e + 1] = 0.0
-
-        return proc_ranges, bubble_distance, bubble_angle
-
-    def calculate_bubble_radius(self, bubble_distance):
-        if bubble_distance >= self.bubble_distance_threshold:
-            bubble_radius = self.max_bubble_radius
-        else:
-            bubble_radius = ((bubble_distance / self.bubble_distance_threshold) *
-                             (self.max_bubble_radius - self.min_bubble_radius) + self.min_bubble_radius)
-        return float(np.clip(bubble_radius, self.min_bubble_radius, self.max_bubble_radius))
-
-    def set_nearest_point_bubble(self, ranges, angle_increment):
-        """정면 최단거리 포인트에도 항상 버블 1개 생성(정면 들이대기 방지)"""
-        safe = np.where(ranges == 0.0, np.inf, ranges)
-        if not np.any(np.isfinite(safe)):
-            return ranges  # 유효 없음
-        idx = int(np.argmin(safe))
-        dist = float(safe[idx])
-
-        # 작은 각 근사: theta ≈ 2*atan(R/(2D))
-        R = self.min_bubble_radius
-        theta = 2.0 * np.arctan(R / max(2.0 * dist, 1e-6))
-        bubble_size = max(1, int(theta / angle_increment))
-
-        s = max(0, idx - bubble_size)
-        e = min(len(ranges) - 1, idx + bubble_size)
-        ranges[s:e + 1] = 0.0
-        return ranges
-
-    def find_max_gap(self, proc_ranges, disparities):
-        """0.0/디스패리티 제외하고 가장 '길고 멀리' 열린 gap 선택"""
-        exclusion_indices = set(np.where(proc_ranges == 0.0)[0])
-        exclusion_indices.update(disparities)
-        valid_indices = [i for i in range(len(proc_ranges))
-                         if i not in exclusion_indices and proc_ranges[i] >= self.min_gap_distance]
-        if not valid_indices:
-            return None, None
-
-        gaps = np.split(valid_indices, np.where(np.diff(valid_indices) > 1)[0] + 1)
-        filtered = [g for g in gaps if len(g) >= self.min_gap_size]
-        if not filtered:
-            return None, None
-
-        # 평균거리 최대 gap 선택
-        max_gap = max(filtered, key=lambda g: np.mean(proc_ranges[g]))
-        return int(max_gap[0]), int(max_gap[-1])
-
-    # ---------------- 메인 콜백 ----------------
-    def scan_callback(self, data: LaserScan):
-        ranges = np.array(data.ranges, dtype=np.float32)
-        ranges[np.isinf(ranges)] = self.lidar_cap
-        ranges[np.isnan(ranges)] = 0.0
-
-        # ① FOV 안전 클램프
-        angle_start, angle_end = self._fov_indices(data, self.fov_deg_min, self.fov_deg_max)
-        # FOV 밖 무시
-        ranges[:angle_start] = 0.0
-        ranges[angle_end + 1:] = 0.0
-
-        # ① (계속) 무시구간 제외한 유효 FOV에서만 disparity
-        disparities = self.find_disparities_valid(ranges, self.disparity_threshold, angle_start, angle_end)
-
-        # disparity 기반 버블
-        proc_ranges, bubble_distance, bubble_angle = self.create_safety_bubble(
-            ranges, disparities, data.angle_min, data.angle_increment)
-
-        # ② 최단거리 포인트에도 버블 추가
-        proc_ranges = self.set_nearest_point_bubble(proc_ranges, data.angle_increment)
-
-        # 버블 마커 (있을 때만)
-        if bubble_distance is not None and bubble_angle is not None and np.isfinite(bubble_distance):
-            self.publish_closest_bubble_marker(bubble_distance, bubble_angle)
-
-        # ③ gap 탐색
-        start_index, end_index = self.find_max_gap(proc_ranges, disparities)
-        if start_index is None or end_index is None or end_index < start_index:
-            self.get_logger().info("No valid gaps available for navigation.")
-            # 제동
-            self._reactive_control(steering_angle=0.0, speed_hint=self.min_speed)
-            return
-
-        # ③ best point = (중앙 ⊕ 거리^2 가중 중앙)
-        gap_indices = np.arange(start_index, end_index + 1)
-        gap_ranges = proc_ranges[gap_indices]
-        w = np.clip(gap_ranges, 0.0, None) ** 2
-        if np.sum(w) > 1e-6:
-            weighted_idx = int(np.average(gap_indices, weights=w))
-        else:
-            weighted_idx = int((start_index + end_index) // 2)
-        mid_idx = int((start_index + end_index) // 2)
-        best_point = int(np.clip(int(0.5 * weighted_idx + 0.5 * mid_idx), start_index, end_index))
-        best_point_distance = float(proc_ranges[best_point])
-
-        # 마커 표시
-        self.publish_best_point_marker(best_point, best_point_distance, data.angle_min, data.angle_increment)
-
-        # 목표 조향각
-        best_point_angle = data.angle_min + best_point * data.angle_increment
-
-        # ④ 속도/조향 완만화 + 레이트 제한 포함
-        speed_cmd = self.calculate_speed(best_point_angle, best_point_distance)
-        self._reactive_control(steering_angle=best_point_angle, speed_hint=speed_cmd)
-
-    # ---------------- 속도/제어 ----------------
-    def calculate_speed(self, steering_angle, distance):
-        """각도가 클수록 감속. 거리 기반 상향은 과감히 배제(안정성 우선)."""
-        steer_lim = np.radians(self.max_steer_deg)
-        angle_factor = min(1.0, abs(steering_angle) / max(steer_lim, 1e-6))
-        angle_speed = self.max_speed - self.angle_gain_speed * angle_factor
-        return float(np.clip(angle_speed, self.min_speed, self.max_speed))
-
-    def _reactive_control(self, steering_angle, speed_hint):
+    def publish_drive(self, steering_angle_rad, speed):
+        # 물리적 조향각 한계 클리핑
+        max_rad = np.radians(self.max_steer_deg)
+        steering_angle_rad = float(np.clip(steering_angle_rad, -max_rad, max_rad))
         msg = AckermannDriveStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = 'ego_racecar/base_link'
-
-        # 조향 제한
-        steer_lim = np.radians(self.max_steer_deg)
-        steer_cmd = float(np.clip(steering_angle, -steer_lim, steer_lim))
-        speed_cmd = float(np.clip(speed_hint, self.min_speed, self.max_speed))
-
-        # EMA
-        speed_f = self.alpha_v * speed_cmd + (1.0 - self.alpha_v) * self.prev_speed
-        steer_f = self.alpha_s * steer_cmd + (1.0 - self.alpha_s) * self.prev_steer
-
-        # 레이트 제한
-        dv = np.clip(speed_f - self.prev_speed, -self.max_dv, self.max_dv)
-        ds = np.clip(steer_f - self.prev_steer, -np.radians(self.max_ds_deg), np.radians(self.max_ds_deg))
-        speed_out = self.prev_speed + dv
-        steer_out = self.prev_steer + ds
-
-        msg.drive.steering_angle = float(steer_out)
-        msg.drive.speed = float(speed_out)
-
+        msg.drive.steering_angle = steering_angle_rad
+        msg.drive.speed = float(np.clip(speed, 0.0, self.max_speed * 1.5))
         self.drive_pub.publish(msg)
-        self.prev_speed = speed_out
-        self.prev_steer = steer_out
+        self.get_logger().info(f"Steering: {np.degrees(steering_angle_rad):.2f} deg | Speed: {msg.drive.speed:.2f} m/s")
 
-        self.get_logger().info(f"Steering Angle: {np.degrees(steer_out):.2f} deg, Speed: {speed_out:.2f} m/s")
+    # ---------- Main Callback ----------
+    def lidar_callback(self, data: LaserScan):
+        ranges_full = np.array(data.ranges, dtype=float)
+
+        # FOV 인덱스 계산
+        def deg_to_idx(deg):
+            return int((np.radians(deg) - data.angle_min) / data.angle_increment)
+
+        min_idx = deg_to_idx(self.deg_min)
+        max_idx = deg_to_idx(self.deg_max)
+        min_idx_bub = deg_to_idx(self.deg_min_bubble)
+        max_idx_bub = deg_to_idx(self.deg_max_bubble)
+
+        # 범위 외 마스킹
+        ranges_full[:min_idx] = 0.0
+        ranges_full[max_idx:] = 0.0
+
+        # 전처리
+        proc = self.preprocess_lidar(ranges_full[min_idx:max_idx])
+        proc_bub = self.preprocess_lidar(ranges_full[min_idx_bub:max_idx_bub])
+
+        # 디스패리티 확장
+        proc = self.find_n_extend_disparity(proc, self.disparity_threshold, self.extend_num)
+
+        # 가장 가까운 점 (버블 기준은 중앙 좁은 FOV에서)
+        if len(proc) == 0 or len(proc_bub) == 0:
+            self.publish_drive(0.0, 0.0)
+            return
+        closest_idx_bub_local = int(np.argmin(proc_bub))
+        closest_dist_bub = float(proc_bub[closest_idx_bub_local])
+        closest_idx_bub_global = closest_idx_bub_local + (min_idx_bub - min_idx)
+
+        # 안전 버블 마스킹
+        proc = self.set_safety_bubble(closest_idx_bub_global, proc, data.angle_increment, closest_dist_bub)
+
+        # 최대 갭 + fine gap 
+        start_m, end_m = self.find_max_gap(proc)
+        start_f, end_f = self.find_fine_gap(proc, self.fine_threshold, self.fine_min_length,
+                                            self.fine_min_range, self.fine_min_width, data.angle_increment)
+
+        # 베스트 포인트 결정: fine 우선, 없으면 평균 윈도우 최대
+        if start_f is not None and end_f is not None:
+            best_idx_local = (start_f + end_f) // 2
+        else:
+            best_idx_local = self.find_best_point_avg(start_m, end_m, proc, window_size=20)
+
+        # 전역 인덱스 & 각도
+        best_idx_global = best_idx_local + min_idx
+        best_angle = data.angle_min + best_idx_global * data.angle_increment
+        best_dist = float(proc[best_idx_local]) if 0 <= best_idx_local < len(proc) else 0.0
+
+        # RViz 마커
+        self.publish_best_point_marker(best_idx_global, best_dist, data.angle_min, data.angle_increment)
+        self.publish_bubble_marker(closest_idx_bub_local + min_idx_bub, closest_dist_bub, data.angle_min, data.angle_increment)
+
+        # 속도 계산 (2번)
+        speed = self.calculate_speed(best_angle, best_dist)
+        self.publish_drive(best_angle, speed)
 
 
 def main(args=None):
     rclpy.init(args=args)
-    print("Reactive Gap Follower (with 4 safety patches) Initialized")
     node = GapFollow()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
