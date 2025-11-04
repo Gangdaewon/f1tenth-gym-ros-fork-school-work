@@ -55,6 +55,11 @@ class GapFollow(Node):
         self.max_bubble_radius = 0.4     # RViz 표시용 동적 반경 최대치
         self.bubble_distance_threshold = 10.0  # 동적 표시 스케일 범위
 
+        # Best point 정규화 파라미터
+        self.center_bias_strength = 0.01   # 중앙 선호 강도 (작을수록 강한 중앙 선호)
+        self.straight_window_size = 30     # 직선 주행 시 윈도우 크기
+        self.curve_window_size = 20        # 커브 주행 시 윈도우 크기
+
         self.get_logger().info("Merged GapFollow Node Initialized")
 
     # ---------- Utilities ----------
@@ -155,9 +160,17 @@ class GapFollow(Node):
             opt = max(long_gaps, key=lambda g: max(ranges[idx] for idx in g))
         return (opt[0], opt[-1]) if opt else (None, None)
 
-    def find_best_point_avg(self, start_idx, end_idx, ranges, window_size=20):
+    def find_best_point_avg(self, start_idx, end_idx, ranges, window_size=20, center_bias_strength=0.01):
         """
         Gap 내에서 이동 평균 최대값 찾기 (중앙 선호 가중치 추가)
+        
+        Args:
+            center_bias_strength: 중앙 선호 강도
+                - 0.001: 매우 강한 중앙 선호 (거의 중앙 고정)
+                - 0.01: 강한 중앙 선호 (기본값)
+                - 0.05: 중간 중앙 선호
+                - 0.1: 약한 중앙 선호
+                - 1.0: 중앙 선호 거의 없음 (거리만 고려)
         """
         sub = ranges[start_idx:end_idx]
         if len(sub) == 0:
@@ -169,7 +182,7 @@ class GapFollow(Node):
         
         # 중앙 선호 가중치 추가 (직선 주행 안정화)
         center_idx = len(smoothed) // 2
-        center_bias = np.exp(-0.01 * np.abs(np.arange(len(smoothed)) - center_idx))
+        center_bias = np.exp(-center_bias_strength * np.abs(np.arange(len(smoothed)) - center_idx))
         weighted = smoothed * center_bias
         
         return weighted.argmax() + start_idx
@@ -294,9 +307,13 @@ class GapFollow(Node):
         if is_straight_clear:
             # 직선 구간이 30.0만 있음 → normalize 적용 (중앙 선호)
             if start_f is not None and end_f is not None:
-                best_idx_local = self.find_best_point_avg(start_f, end_f, proc, window_size=30)
+                best_idx_local = self.find_best_point_avg(start_f, end_f, proc, 
+                                                          window_size=self.straight_window_size,
+                                                          center_bias_strength=self.center_bias_strength)
             else:
-                best_idx_local = self.find_best_point_avg(start_m, end_m, proc, window_size=20)
+                best_idx_local = self.find_best_point_avg(start_m, end_m, proc, 
+                                                          window_size=self.straight_window_size,
+                                                          center_bias_strength=self.center_bias_strength)
         else:
             # 직선 구간에 장애물 있음 → 원본 로직 (단순 중앙값)
             if start_f is not None and end_f is not None:
