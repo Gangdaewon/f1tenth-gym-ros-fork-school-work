@@ -184,14 +184,22 @@ class GapFollow(Node):
 
     def find_best_point_avg(self, start_idx, end_idx, ranges, window_size=20):
         """
-        Gap 내에서 이동 평균 최대값 찾기
+        Gap 내에서 이동 평균 최대값 찾기 (중앙 선호 가중치 추가)
         """
         sub = ranges[start_idx:end_idx]
         if len(sub) == 0:
             return (start_idx + end_idx) // 2
+        
+        # 이동 평균으로 스무딩
         kernel = np.ones(window_size) / window_size
         smoothed = np.convolve(sub, kernel, mode='same')
-        return smoothed.argmax() + start_idx
+        
+        # 중앙 선호 가중치 추가 (직선 주행 안정화)
+        center_idx = len(smoothed) // 2
+        center_bias = np.exp(-0.01 * np.abs(np.arange(len(smoothed)) - center_idx))
+        weighted = smoothed * center_bias
+        
+        return weighted.argmax() + start_idx
 
     def smooth_angle(self, current_angle, alpha):
         """
@@ -337,8 +345,10 @@ class GapFollow(Node):
 
         # 베스트 포인트 결정: fine 우선, 없으면 평균 윈도우 최대
         if start_f is not None and end_f is not None:
-            best_idx_local = (start_f + end_f) // 2
+            # fine gap이 있으면 중앙 선호 + 더 부드러운 스무딩
+            best_idx_local = self.find_best_point_avg(start_f, end_f, proc, window_size=30)
         else:
+            # max gap 사용
             best_idx_local = self.find_best_point_avg(start_m, end_m, proc, window_size=20)
 
         # 전역 인덱스 & 각도
