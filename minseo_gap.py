@@ -43,11 +43,15 @@ class GapFollow(Node):
         self.fine_min_width = 0.5          # fine gap: 실제 폭(m) 조건
         self.min_consecutive = 20          # lidar 전처리 : 최소 연속 유효값 개수
 
-        # FOV 선택: 주행 의사결정 범위(-85~85deg), 버블 전용(-45~45deg)
+        # FOV 선택: 주행 의사결정 범위(-60~60deg), 버블 전용(-45~45deg)
         self.deg_min = -60
         self.deg_max = 60
         self.deg_min_bubble = -45
         self.deg_max_bubble = 45
+        
+        # Best point 안정화 파라미터
+        self.angle_smoothing_alpha = 0.3   # 각도 smoothing 계수 (0~1, 작을수록 부드러움)
+        self.prev_best_angle = 0.0         # 이전 best angle 저장
 
         # Safety bubble 
         self.fixed_bubble_radius = 0.35  # 버블 반경(m) – 마스킹 계산용
@@ -59,10 +63,18 @@ class GapFollow(Node):
 
     # ---------- Utilities ----------
     def preprocess_lidar(self, arr):
+        """
+        LiDAR 데이터 전처리
+        1. inf, nan 처리
+        2. 범위 클리핑
+        3. 20개 미만 연속 유효값 제거 (작은 틈 마스킹)
+        """
         arr = arr.copy()
-        arr[np.isinf(arr)] = self.LIDAR_RANGE_CAP * 3  # 먼 곳은 크게
-        arr[np.isnan(arr)] = 0.0
-        arr[arr > self.LIDAR_RANGE_CAP] = self.LIDAR_RANGE_CAP
+        arr[np.isinf(arr)] = self.LIDAR_RANGE_CAP * 3  # inf → 30.0m
+        arr[np.isnan(arr)] = 0.0                        # nan → 0.0
+        arr[arr > self.LIDAR_RANGE_CAP] = self.LIDAR_RANGE_CAP  # 10m로 클리핑
+        
+        # 20개 미만의 연속된 유효 값을 0.0으로 변경 (작은 틈 제거)
         i = 0
         while i < len(arr):
             if arr[i] > 0.0:  # 유효한 값 시작
@@ -72,17 +84,21 @@ class GapFollow(Node):
                 while i < len(arr) and arr[i] > 0.0:
                     count += 1
                     i += 1
-                # 20개(1도 당 index 4개) 미만이면 0.0으로 치환
+                # min_consecutive 미만이면 0.0으로 치환
                 if count < self.min_consecutive:
                     arr[start:start + count] = 0.0
             else:
                 i += 1
+        
         return arr
 
     def find_n_extend_disparity(self, ranges, disparity_threshold, extend_num):
-        # 1) disparity 찾기
+        """
+        디스패리티 찾아서 확장
+        """
         ranges = ranges.copy()
         disps = []
+        # 1) disparity 찾기
         for i in range(1, len(ranges)):
             if abs(ranges[i] - ranges[i - 1]) > disparity_threshold:
                 disps.append((i, ranges[i]))
@@ -103,7 +119,9 @@ class GapFollow(Node):
         return ranges
 
     def set_safety_bubble(self, closest_idx, proc_ranges, angle_increment, closest_dist):
-        # 고정 반경을 각도로 변환해 마스킹
+        """
+        가장 가까운 장애물 주변에 안전 버블 설정
+        """
         if closest_dist <= 0.0:
             return proc_ranges
         bubble_angle = 2 * np.arctan(self.fixed_bubble_radius / (2 * max(closest_dist, 1e-3)))
@@ -114,6 +132,9 @@ class GapFollow(Node):
         return proc_ranges
 
     def find_max_gap(self, ranges):
+        """
+        가장 긴 연속 gap 찾기
+        """
         masked = np.ma.masked_where(ranges <= 0.0, ranges)
         slices = np.ma.notmasked_contiguous(masked)
         if not slices:
@@ -122,7 +143,11 @@ class GapFollow(Node):
         return largest.start, largest.stop
 
     def find_fine_gap(self, ranges, threshold, min_length, min_range, min_width, angle_increment):
+        """
+        고품질 gap 찾기 (거리, 길이, 폭 조건 모두 만족)
+        """
         gaps, s, cnt = [], None, 0
+        # 1) threshold 이상인 구간 찾기
         for i in range(len(ranges)):
             if ranges[i] > threshold:
                 if s is None:
@@ -137,6 +162,7 @@ class GapFollow(Node):
         if not gaps:
             return None, None
 
+        # 2) 실제 폭 검증
         valid = []
         for g in gaps:
             g_s, g_e = g[0], g[-1]
@@ -148,6 +174,7 @@ class GapFollow(Node):
         if not valid:
             return None, None
 
+        # 3) 길이 조건 만족하는 gap 중 최대 거리 선택
         long_gaps = [g for g in valid if len(g) >= min_range]
         if not long_gaps:
             opt = max(valid, key=lambda g: len(g))
@@ -156,6 +183,9 @@ class GapFollow(Node):
         return (opt[0], opt[-1]) if opt else (None, None)
 
     def find_best_point_avg(self, start_idx, end_idx, ranges, window_size=20):
+        """
+        Gap 내에서 이동 평균 최대값 찾기
+        """
         sub = ranges[start_idx:end_idx]
         if len(sub) == 0:
             return (start_idx + end_idx) // 2
@@ -163,8 +193,29 @@ class GapFollow(Node):
         smoothed = np.convolve(sub, kernel, mode='same')
         return smoothed.argmax() + start_idx
 
+    def smooth_angle(self, current_angle, alpha):
+        """
+        이동 평균을 이용한 각도 스무딩 (Exponential Moving Average)
+        
+        Args:
+            current_angle: 현재 계산된 각도 (radians)
+            alpha: 스무딩 계수 (0~1)
+                  - 0.2: 매우 부드러움, 느린 반응
+                  - 0.3: 균형잡힌 스무딩 (기본값)
+                  - 0.5: 빠른 반응, 약간의 떨림
+                  - 1.0: 스무딩 없음
+        
+        Returns:
+            스무딩된 각도 (radians)
+        """
+        smoothed_angle = alpha * current_angle + (1 - alpha) * self.prev_best_angle
+        self.prev_best_angle = smoothed_angle
+        return smoothed_angle
+
     def calculate_scale_factor(self, distance):
-        # RViz 마커 크기 스케일
+        """
+        RViz 마커 크기 스케일 계산
+        """
         if distance <= self.min_bubble_radius:
             return 0.0
         if distance >= self.bubble_distance_threshold:
@@ -173,6 +224,9 @@ class GapFollow(Node):
 
     # ---------- Markers ----------
     def publish_best_point_marker(self, best_idx, best_dist, angle_min, angle_increment):
+        """
+        Best point 마커 발행 (녹색 구)
+        """
         ang = angle_min + best_idx * angle_increment
         x = best_dist * np.cos(ang)
         y = best_dist * np.sin(ang)
@@ -188,6 +242,9 @@ class GapFollow(Node):
         self.best_point_marker_pub.publish(m)
 
     def publish_bubble_marker(self, idx, dist, angle_min, angle_increment):
+        """
+        Bubble point 마커 발행 (파란색 구, 동적 크기)
+        """
         ang = angle_min + idx * angle_increment
         x = dist * np.cos(ang)
         y = dist * np.sin(ang)
@@ -207,17 +264,23 @@ class GapFollow(Node):
 
     # ---------- Speed / Control ----------
     def calculate_speed(self, steering_angle_rad, distance):
+        """
+        조향각과 거리 기반 속도 계산
+        """
         # 조향 큰 경우 감속
-        angle_speed = self.max_speed - abs(steering_angle_rad * 13.0) # 11.0)
+        angle_speed = self.max_speed - abs(steering_angle_rad * 13.0)
         angle_speed = np.clip(angle_speed, self.min_speed, self.max_speed)
         # 베스트 포인트까지 거리 기반 보정
-        if distance > 3.0: # 4.0:
-            dist_speed = max(self.max_speed, distance / 0.95) # 0.95
+        if distance > 3.0:
+            dist_speed = max(self.max_speed, distance / 0.95)
         else:
-            dist_speed = min(self.max_speed * 1.5, distance / 0.95) # 1.5
+            dist_speed = min(self.max_speed * 1.5, distance / 0.95)
         return float(min(angle_speed, dist_speed))
 
     def publish_drive(self, steering_angle_rad, speed):
+        """
+        주행 명령 발행
+        """
         # 물리적 조향각 한계 클리핑
         max_rad = np.radians(self.max_steer_deg)
         steering_angle_rad = float(np.clip(steering_angle_rad, -max_rad, max_rad))
@@ -231,6 +294,9 @@ class GapFollow(Node):
 
     # ---------- Main Callback ----------
     def lidar_callback(self, data: LaserScan):
+        """
+        LiDAR 콜백 - 메인 로직
+        """
         ranges_full = np.array(data.ranges, dtype=float)
 
         # FOV 인덱스 계산
@@ -246,7 +312,7 @@ class GapFollow(Node):
         ranges_full[:min_idx] = 0.0
         ranges_full[max_idx:] = 0.0
 
-        # 전처리
+        # 전처리 (inf/nan 처리 + 작은 틈 제거)
         proc = self.preprocess_lidar(ranges_full[min_idx:max_idx])
         proc_bub = self.preprocess_lidar(ranges_full[min_idx_bub:max_idx_bub])
 
@@ -280,11 +346,14 @@ class GapFollow(Node):
         best_angle = data.angle_min + best_idx_global * data.angle_increment
         best_dist = float(proc[best_idx_local]) if 0 <= best_idx_local < len(proc) else 0.0
 
+        # 각도 안정화 (스무딩 적용)
+        best_angle = self.smooth_angle(best_angle, self.angle_smoothing_alpha)
+
         # RViz 마커
         self.publish_best_point_marker(best_idx_global, best_dist, data.angle_min, data.angle_increment)
         self.publish_bubble_marker(closest_idx_bub_local + min_idx_bub, closest_dist_bub, data.angle_min, data.angle_increment)
 
-        # 속도 계산 (2번)
+        # 속도 계산 및 주행 명령
         speed = self.calculate_speed(best_angle, best_dist)
         self.publish_drive(best_angle, speed)
 
