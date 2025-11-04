@@ -32,10 +32,10 @@ class GapFollow(Node):
         self.disparity_threshold = 0.5         # 라이다 인덱스 i와 i+1의 거리차가 0.5m 이상이면 disparity로 간주
         
         # Multi-bubble parameters (레이싱 최적화)
-        self.bubble_creation_distance = 4.0    # 이 거리 이내 모든 장애물에 버블 생성 (meters)
-        self.min_bubble_radius = 0.25          # Minimum bubble radius (meters) - 증가
-        self.max_bubble_radius = 0.8           # Maximum bubble radius (meters) - 증가
-        self.bubble_distance_threshold = 10.0  # Distance at which bubble is maximum size
+        self.bubble_creation_distance = 3.0    # 이 거리 이내 모든 장애물에 버블 생성 (meters)
+        self.min_bubble_radius = 0.1          # Minimum bubble radius (meters) - 증가
+        self.max_bubble_radius = 0.4           # Maximum bubble radius (meters) - 증가
+        self.bubble_distance_threshold = 5.0  # Distance at which bubble is maximum size
         self.speed_bubble_factor = 0.5         # 속도에 따른 버블 크기 증가 계수
         
         # Gap finding parameters
