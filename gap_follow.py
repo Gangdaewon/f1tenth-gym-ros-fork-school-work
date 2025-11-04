@@ -1,0 +1,315 @@
+import rclpy
+from rclpy.node import Node
+
+import numpy as np
+from sensor_msgs.msg import LaserScan
+from ackermann_msgs.msg import AckermannDriveStamped
+from visualization_msgs.msg import Marker
+from std_msgs.msg import ColorRGBA
+
+
+class GapFollow(Node):
+    def __init__(self):
+        super().__init__('gap_follow_node')
+       
+        # Topics for publishing and subscribing
+        self.lidarscan_topic = '/scan'
+        self.drive_topic = '/drive'
+        self.best_point_marker_topic = '/best_point_marker'
+        self.bubble_marker_topic = '/bubble_point_marker'
+       
+        # Create subscribers and publishers
+        self.lidar_sub = self.create_subscription(
+            LaserScan, self.lidarscan_topic, self.scan_callback, 10)
+        self.drive_pub = self.create_publisher(
+            AckermannDriveStamped, self.drive_topic, 10)
+        self.best_point_marker_pub = self.create_publisher(
+            Marker, self.best_point_marker_topic, 10)
+        self.bubble_marker_pub = self.create_publisher(
+            Marker, self.bubble_marker_topic, 10)
+     
+        # Define additional variables
+        self.disparity_threshold = 0.5         # 라이다 인덱스 i와 i+1의 거리차가 0.5m 이상이면 disparity로 간주
+        self.min_bubble_radius = 0.1           # Minimum bubble radius (meters)
+        self.max_bubble_radius = 0.4           # Maximum bubble radius (meters)
+        self.bubble_distance_threshold = 10.0  # Distance at which bubble is maximum size
+   
+        self.min_gap_distance = 1.5            # 라이다 값 거리가 1.5m 이하들은 버림(너무 가까워서 조향각이 안 나옴)
+        self.min_gap_size = 15                 # Gap과 Gap 사이가 라이다 인덱스 22개 이하면 버림 그 구간 무시(너무 좁음)  # 22
+       
+        self.get_logger().info("GapFollow Node Initialized Successfully")
+
+    def publish_best_point_marker(self, best_point_idx, best_point_distance, angle_min, angle_increment):
+        """Publish a visualization marker for the best point in RViz"""
+        # Calculate angle of best point
+        best_point_angle = angle_min + best_point_idx * angle_increment
+
+        # Convert polar coordinates to Cartesian for visualization
+        x = best_point_distance * np.cos(best_point_angle)
+        y = best_point_distance * np.sin(best_point_angle)
+
+        # Create the Marker message
+        marker = Marker()
+        marker.header.frame_id = "ego_racecar/laser"  # Set the reference frame
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = "best_point"
+        marker.id = 0
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.pose.position.x = x
+        marker.pose.position.y = y
+        marker.pose.position.z = 0.0  # LiDAR is in 2D plane, so z = 0
+        marker.pose.orientation.x = 0.0
+        marker.pose.orientation.y = 0.0
+        marker.pose.orientation.z = 0.0
+        marker.pose.orientation.w = 1.0
+
+        # Scale the marker (make it a small sphere)
+        marker.scale.x = 0.3
+        marker.scale.y = 0.3
+        marker.scale.z = 0.3
+
+        # Set the color of the marker
+        marker.color = ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)  # Green, opaque
+
+        # Publish the Marker
+        self.best_point_marker_pub.publish(marker)
+       
+    def publish_closest_bubble_marker(self, bubble_distance, bubble_angle):
+        """Publish a visualization marker for the closest bubble point in RViz"""
+        """Note: Only one bubble point is needed"""
+        # Convert polar coordinates to Cartesian for visualization
+        x = bubble_distance * np.cos(bubble_angle)
+        y = bubble_distance * np.sin(bubble_angle)
+
+        # Calculate scale factor based on distance
+        scale_factor = self.calculate_scale_factor(bubble_distance)
+
+        # Adjust bubble size based on scaling factor
+        dynamic_bubble_radius = self.min_bubble_radius + (self.max_bubble_radius - self.min_bubble_radius) * scale_factor
+
+        # Create the Marker message
+        marker = Marker()
+        marker.header.frame_id = "ego_racecar/laser"  # Set the reference frame
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = "bubble_point"
+        marker.id = 0
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.pose.position.x = x
+        marker.pose.position.y = y
+        marker.pose.position.z = 0.0  # LiDAR is in 2D plane, so z = 0
+        marker.pose.orientation.x = 0.0
+        marker.pose.orientation.y = 0.0
+        marker.pose.orientation.z = 0.0
+        marker.pose.orientation.w = 1.0
+
+        # Scale the marker (make it a sphere with dynamic radius)
+        marker.scale.x = dynamic_bubble_radius * 2
+        marker.scale.y = dynamic_bubble_radius * 2
+        marker.scale.z = dynamic_bubble_radius * 2
+
+        # Set the color of the marker
+        marker.color = ColorRGBA(r=0.0, g=0.0, b=1.0, a=0.5)  # Blue, semi-transparent
+
+        # Publish the Marker
+        self.bubble_marker_pub.publish(marker)
+           
+    def calculate_scale_factor(self, distance):
+        """Calculate scale factor based on distance (0 to 1)"""
+        if distance <= self.min_bubble_radius:
+            return 0.0
+        elif distance >= self.bubble_distance_threshold:
+            return 1.0
+        else:
+            return (distance - self.min_bubble_radius) / (self.bubble_distance_threshold - self.min_bubble_radius)
+   
+    def find_disparities(self, ranges, threshold):
+        """Find disparities (sudden changes) in the LiDAR distance data"""
+        disparities = []
+        for i in range(len(ranges) - 1):
+            diff = ranges[i + 1] - ranges[i]
+            if abs(diff) > threshold:
+                disparities.append(i if diff > 0 else i + 1)
+        return disparities
+   
+    def create_safety_bubble(self, ranges, disparities, angle_min, angle_increment):
+        """
+        Create a safety bubble around the closest obstacle to ignore that area
+        Only creates one bubble for the closest disparity point
+        """
+        proc_ranges = ranges.copy()
+        if not disparities:
+            self.get_logger().debug("No disparities detected.")
+            return proc_ranges, None, None
+
+        # Filter out invalid disparities
+        valid_disparities = [i for i in disparities if ranges[i] > 0.0]
+        if not valid_disparities:
+            self.get_logger().debug("No valid disparities detected.")
+            return proc_ranges, None, None
+
+        # Select the closest disparity point
+        bubble_index = min(valid_disparities, key=lambda i: ranges[i])
+        bubble_distance = ranges[bubble_index]
+
+        # Calculate bubble radius based on distance
+        bubble_radius = self.calculate_bubble_radius(bubble_distance)
+
+        # Calculate bubble angle
+        bubble_angle = self.get_angle(bubble_index, angle_min, angle_increment)
+
+        # Calculate angular spread based on bubble_radius and distance
+        if bubble_distance > self.min_bubble_radius:
+            # Prevent domain error in arcsin by ensuring R/D <= 1
+            theta = 2 * np.arcsin(min(1.0, bubble_radius / bubble_distance))
+        else:
+            theta = np.pi  # Very close obstacle, cover all
+
+        bubble_size = int(theta / angle_increment / 2)  # Number of indices on one side
+
+        start_index = max(0, bubble_index - bubble_size)
+        end_index = min(len(ranges) - 1, bubble_index + bubble_size)
+        proc_ranges[start_index:end_index + 1] = 0.0  # Ignore bubble area
+
+        self.get_logger().debug(f"Safety Bubble: Start={start_index}, End={end_index}, Index={bubble_index}")
+
+        return proc_ranges, bubble_distance, bubble_angle
+   
+    def calculate_bubble_radius(self, bubble_distance):
+        """Calculate the bubble radius based on the distance to the obstacle"""
+        # Bubble radius increases when far from obstacle and decreases when close
+        if bubble_distance >= self.bubble_distance_threshold:
+            bubble_radius = self.max_bubble_radius
+        else:
+            bubble_radius = ((bubble_distance / self.bubble_distance_threshold) *
+                             (self.max_bubble_radius - self.min_bubble_radius) + self.min_bubble_radius)
+        bubble_radius = np.clip(bubble_radius, self.min_bubble_radius, self.max_bubble_radius)
+        return bubble_radius
+   
+    def find_max_gap(self, proc_ranges, disparities):
+        """
+        Find the largest gap in the processed ranges, excluding disparity regions
+        """
+        exclusion_indices = set(np.where(proc_ranges == 0.0)[0])
+        exclusion_indices.update(disparities)
+        valid_indices = [i for i in range(len(proc_ranges)) if i not in exclusion_indices and proc_ranges[i] >= self.min_gap_distance]
+
+        if not valid_indices:
+            self.get_logger().debug("No valid gaps found.")
+            return None, None
+
+        gaps = np.split(valid_indices, np.where(np.diff(valid_indices) > 1)[0] + 1)
+        filtered_gaps = [gap for gap in gaps if len(gap) >= self.min_gap_size]
+
+        if not filtered_gaps:
+            self.get_logger().debug("No gaps meet the size criteria.")
+            return None, None
+
+        # Select the gap with maximum average distance
+        max_gap = max(filtered_gaps, key=lambda gap: np.mean(proc_ranges[gap]))
+        start_index, end_index = max_gap[0], max_gap[-1]
+
+        self.get_logger().debug(f"Max gap found: Start={start_index}, End={end_index}, Size={len(max_gap)}")
+        return start_index, end_index
+   
+   
+    def scan_callback(self, data):
+        """Process each LiDAR scan as per the Follow Gap algorithm & publish an AckermannDriveStamped Message"""
+        ranges = np.array(data.ranges)
+        # Preprocess LiDAR scan ranges                
+        ranges[np.isinf(ranges)] = 30.0  # Set infinite values to a max distance
+        ranges[np.isnan(ranges)] = 0.0   # Set NaN values to zero
+        angle_start = int((np.radians(-42.5) - data.angle_min) / data.angle_increment)
+        angle_end = int((np.radians(42.5) - data.angle_min) / data.angle_increment)
+        ranges[:angle_start] = 0.0
+        ranges[angle_end:] = 0.0
+       
+        # Find disparities
+        disparities = self.find_disparities(ranges, self.disparity_threshold)
+        self.get_logger().debug(f"Detected Disparities: {disparities}")    
+
+        # Create safety bubble
+        proc_ranges, bubble_distance, bubble_angle = self.create_safety_bubble(
+            ranges, disparities, data.angle_min, data.angle_increment)
+
+        # Publish the closest bubble as a Marker
+        if bubble_distance is not None and bubble_angle is not None:
+            self.publish_closest_bubble_marker(bubble_distance, bubble_angle)
+
+        # Find the largest valid gap
+        start_index, end_index = self.find_max_gap(proc_ranges, disparities)
+        if start_index is not None and end_index is not None:
+            # Find the best point (lidar index) as the middle of the gap
+            best_point = (start_index + end_index) // 2
+            best_point_distance = proc_ranges[best_point]
+
+            # Publish the best point as a Marker
+            self.publish_best_point_marker(
+                best_point, best_point_distance, data.angle_min, data.angle_increment)
+
+            # Calculate the steering angle towards the best point
+            best_point_angle = data.angle_min + best_point * data.angle_increment
+            steering_angle = best_point_angle
+
+            # Calculate speed based on distance
+            speed = self.calculate_speed(steering_angle, best_point_distance)
+
+            # Publish the drive command
+            self.reactive_control(steering_angle, speed)
+        else:
+            self.get_logger().info("No valid gaps available for navigation.")
+            # If no valid gaps, stop the vehicle
+            self.reactive_control(0.0, 0.0)
+       
+       
+    def calculate_speed(self, steering_angle, distance):
+        """Calculate the vehicle's speed based on steering angle and distance"""
+        max_speed = 6.0  # Maximum speed (m/s)  # 7.2
+        min_speed = 4.0 # Minimum speed (m/s)   # 4.5
+
+        # Adjust speed based on steering angle (slower when steering sharply)
+        angle_speed = max_speed - abs(steering_angle * 11 ) # * 2.0
+        angle_speed = np.clip(angle_speed, min_speed, max_speed)
+
+        # Adjust speed based on distance to the best point (slower when closer)
+        if distance > 4.0:
+            distance_speed = max(max_speed, distance / 0.95)
+        else:
+            distance_speed = min(max_speed * 1.5, distance / 0.95)
+        speed = min(angle_speed, distance_speed)
+
+        return speed
+
+    def reactive_control(self, steering_angle, speed):
+        """Calculate and publish the steering angle and speed based on the best gap angle"""
+        drive_msg = AckermannDriveStamped()
+        drive_msg.header.stamp = self.get_clock().now().to_msg()
+        drive_msg.header.frame_id = 'ego_racecar/base_link'
+
+        drive_msg.drive.steering_angle = steering_angle
+        drive_msg.drive.speed = speed
+
+        # Publish the message
+        self.drive_pub.publish(drive_msg)
+        self.get_logger().info(
+            f"Steering Angle: {np.degrees(steering_angle):.2f} deg, Speed: {speed:.2f} m/s")
+
+
+    def get_angle(self, index, angle_min, angle_increment):
+        """Convert index to angle"""
+        return angle_min + index * angle_increment
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    print("Reactive Gap Follower Node Initialized")
+    reactive_node = GapFollow()
+    rclpy.spin(reactive_node)
+
+    reactive_node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
