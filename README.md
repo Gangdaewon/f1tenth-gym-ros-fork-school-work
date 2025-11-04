@@ -35,6 +35,7 @@ docker build -t f1tenth_gym_ros -f Dockerfile .
 ```
 
 ### 2️⃣ Docker 컨테이너 실행
+@ f1tenth_gym_ros
 
 ```bash
 docker-compose up
@@ -55,7 +56,7 @@ docker ps
 
 **터미널에서 Docker 컨테이너 접속:**
 ```bash
-docker exec -it f1tenth_gym_ros_sim_1 /bin/bash
+docker exec -it f1tenth-gym-ros-fork-school-work_sim_1 /bin/bash
 ```
 
 **컨테이너 내부에서 시뮬레이션 실행:**
