@@ -56,8 +56,8 @@ class GapFollow(Node):
         self.bubble_distance_threshold = 10.0  # 동적 표시 스케일 범위
 
         # Best point 정규화 파라미터
-        self.center_bias_strength = 0.01   # 중앙 선호 강도 (작을수록 강한 중앙 선호)
-        self.straight_window_size = 30     # 직선 주행 시 윈도우 크기
+        self.center_bias_strength = 0.003   # 중앙 선호 강도 (작을수록 강한 중앙 선호)
+        self.straight_window_size = 5     # 직선 주행 시 윈도우 크기
         self.curve_window_size = 20        # 커브 주행 시 윈도우 크기
 
         self.get_logger().info("Merged GapFollow Node Initialized")
