@@ -33,7 +33,6 @@ class GapFollow(Node):
         self.min_bubble_radius = 0.1           # Minimum bubble radius (meters)
         self.max_bubble_radius = 0.4           # Maximum bubble radius (meters)
         self.bubble_distance_threshold = 10.0  # Distance at which bubble is maximum size
-        self.bubble_creation_distance = 5.0    # Only create bubbles for obstacles closer than this distance (meters)
    
         self.min_gap_distance = 1.5            # 라이다 값 거리가 1.5m 이하들은 버림(너무 가까워서 조향각이 안 나옴)
         self.min_gap_size = 15                 # Gap과 Gap 사이가 라이다 인덱스 22개 이하면 버림 그 구간 무시(너무 좁음)  # 22
@@ -76,8 +75,9 @@ class GapFollow(Node):
         # Publish the Marker
         self.best_point_marker_pub.publish(marker)
        
-    def publish_bubble_marker(self, bubble_distance, bubble_angle, marker_id=0):
-        """Publish a visualization marker for a bubble point in RViz"""
+    def publish_closest_bubble_marker(self, bubble_distance, bubble_angle):
+        """Publish a visualization marker for the closest bubble point in RViz"""
+        """Note: Only one bubble point is needed"""
         # Convert polar coordinates to Cartesian for visualization
         x = bubble_distance * np.cos(bubble_angle)
         y = bubble_distance * np.sin(bubble_angle)
@@ -93,7 +93,7 @@ class GapFollow(Node):
         marker.header.frame_id = "ego_racecar/laser"  # Set the reference frame
         marker.header.stamp = self.get_clock().now().to_msg()
         marker.ns = "bubble_point"
-        marker.id = marker_id  # Support multiple bubbles with different IDs
+        marker.id = 0
         marker.type = Marker.SPHERE
         marker.action = Marker.ADD
         marker.pose.position.x = x
@@ -135,58 +135,46 @@ class GapFollow(Node):
    
     def create_safety_bubble(self, ranges, disparities, angle_min, angle_increment):
         """
-        Create safety bubbles around obstacles closer than bubble_creation_distance
-        Returns processed ranges and list of bubble information
+        Create a safety bubble around the closest obstacle to ignore that area
+        Only creates one bubble for the closest disparity point
         """
         proc_ranges = ranges.copy()
-        bubble_info_list = []
-        
         if not disparities:
             self.get_logger().debug("No disparities detected.")
-            return proc_ranges, bubble_info_list
+            return proc_ranges, None, None
 
-        # Filter disparities: valid distance and within creation distance threshold
-        close_disparities = [i for i in disparities 
-                            if ranges[i] > 0.0 and ranges[i] < self.bubble_creation_distance]
-        
-        if not close_disparities:
-            self.get_logger().debug(f"No disparities within {self.bubble_creation_distance}m threshold.")
-            return proc_ranges, bubble_info_list
+        # Filter out invalid disparities
+        valid_disparities = [i for i in disparities if ranges[i] > 0.0]
+        if not valid_disparities:
+            self.get_logger().debug("No valid disparities detected.")
+            return proc_ranges, None, None
 
-        # Create bubbles for all close disparities
-        for bubble_index in close_disparities:
-            bubble_distance = ranges[bubble_index]
+        # Select the closest disparity point
+        bubble_index = min(valid_disparities, key=lambda i: ranges[i])
+        bubble_distance = ranges[bubble_index]
 
-            # Calculate bubble radius based on distance
-            bubble_radius = self.calculate_bubble_radius(bubble_distance)
+        # Calculate bubble radius based on distance
+        bubble_radius = self.calculate_bubble_radius(bubble_distance)
 
-            # Calculate bubble angle
-            bubble_angle = self.get_angle(bubble_index, angle_min, angle_increment)
+        # Calculate bubble angle
+        bubble_angle = self.get_angle(bubble_index, angle_min, angle_increment)
 
-            # Calculate angular spread based on bubble_radius and distance
-            if bubble_distance > self.min_bubble_radius:
-                # Prevent domain error in arcsin by ensuring R/D <= 1
-                theta = 2 * np.arcsin(min(1.0, bubble_radius / bubble_distance))
-            else:
-                theta = np.pi  # Very close obstacle, cover all
+        # Calculate angular spread based on bubble_radius and distance
+        if bubble_distance > self.min_bubble_radius:
+            # Prevent domain error in arcsin by ensuring R/D <= 1
+            theta = 2 * np.arcsin(min(1.0, bubble_radius / bubble_distance))
+        else:
+            theta = np.pi  # Very close obstacle, cover all
 
-            bubble_size = int(theta / angle_increment / 2)  # Number of indices on one side
+        bubble_size = int(theta / angle_increment / 2)  # Number of indices on one side
 
-            start_index = max(0, bubble_index - bubble_size)
-            end_index = min(len(ranges) - 1, bubble_index + bubble_size)
-            proc_ranges[start_index:end_index + 1] = 0.0  # Ignore bubble area
+        start_index = max(0, bubble_index - bubble_size)
+        end_index = min(len(ranges) - 1, bubble_index + bubble_size)
+        proc_ranges[start_index:end_index + 1] = 0.0  # Ignore bubble area
 
-            self.get_logger().debug(f"Safety Bubble: Start={start_index}, End={end_index}, Index={bubble_index}, Distance={bubble_distance:.2f}m")
-            
-            # Store bubble information
-            bubble_info_list.append({
-                'distance': bubble_distance,
-                'angle': bubble_angle,
-                'radius': bubble_radius,
-                'index': bubble_index
-            })
+        self.get_logger().debug(f"Safety Bubble: Start={start_index}, End={end_index}, Index={bubble_index}")
 
-        return proc_ranges, bubble_info_list
+        return proc_ranges, bubble_distance, bubble_angle
    
     def calculate_bubble_radius(self, bubble_distance):
         """Calculate the bubble radius based on the distance to the obstacle"""
@@ -241,17 +229,13 @@ class GapFollow(Node):
         disparities = self.find_disparities(ranges, self.disparity_threshold)
         self.get_logger().debug(f"Detected Disparities: {disparities}")    
 
-        # Create safety bubbles (multiple bubbles for obstacles within threshold distance)
-        proc_ranges, bubble_info_list = self.create_safety_bubble(
+        # Create safety bubble
+        proc_ranges, bubble_distance, bubble_angle = self.create_safety_bubble(
             ranges, disparities, data.angle_min, data.angle_increment)
 
-        # Publish all bubbles as Markers
-        for i, bubble_info in enumerate(bubble_info_list):
-            self.publish_bubble_marker(
-                bubble_info['distance'], 
-                bubble_info['angle'], 
-                marker_id=i
-            )
+        # Publish the closest bubble as a Marker
+        if bubble_distance is not None and bubble_angle is not None:
+            self.publish_closest_bubble_marker(bubble_distance, bubble_angle)
 
         # Find the largest valid gap
         start_index, end_index = self.find_max_gap(proc_ranges, disparities)
