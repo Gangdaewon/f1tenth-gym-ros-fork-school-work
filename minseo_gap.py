@@ -40,7 +40,7 @@ class GapFollow(Node):
         self.fine_threshold = 2.0          # fine gap: 최소 거리 임계
         self.fine_min_length = 5           # fine gap: 최소 인덱스 길이
         self.fine_min_range = 2.5          # fine gap: 길이 기반 필터
-        self.fine_min_width = 2.0 # 0.5          # fine gap: 실제 폭(m) 조건
+        self.fine_min_width = 0.5          # fine gap: 실제 폭(m) 조건
         self.min_consecutive = 20
 
         # FOV 선택: 주행 의사결정 범위(-85~85deg), 버블 전용(-45~45deg)
@@ -72,7 +72,7 @@ class GapFollow(Node):
                 while i < len(arr) and arr[i] > 0.0:
                     count += 1
                     i += 1
-                # 20개 미만이면 0.0으로 치환
+                # 20개(1 degree == 4) 미만이면 0.0으로 치환
                 if count < self.min_consecutive:
                     arr[start:start + count] = 0.0
             else:
