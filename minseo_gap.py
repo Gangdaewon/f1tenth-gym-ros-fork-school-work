@@ -30,42 +30,41 @@ class GapFollow(Node):
         self.LIDAR_RANGE_CAP = 10.0
 
         # Speed logic 
-        self.max_speed = 8.5    # m/s (상황에 따라 조정)
+        self.max_speed = 10.0    # m/s (상황에 따라 조정)
         self.min_speed = 4.5     # m/s
         self.max_steer_deg = 20.0  # 물리적 조향 한계(안전 클리핑)
 
         # Gap/Disparity/Fine-gap parameters 
-        self.disparity_threshold = 2.5     # 디스패리티 탐지 임계
+        self.disparity_threshold = 1.0     # 디스패리티 탐지 임계
         self.extend_num = 1                # 디스패리티 확장 폭
         self.fine_threshold = 2.0          # fine gap: 최소 거리 임계
         self.fine_min_length = 5           # fine gap: 최소 인덱스 길이
         self.fine_min_range = 2.5          # fine gap: 길이 기반 필터
         self.fine_min_width = 0.5          # fine gap: 실제 폭(m) 조건
-        self.min_consecutive = 20          # lidar 전처리 : 최소 연속 유효값 개수
+        self.min_consecutive = 30          # lidar 전처리 : 최소 연속 유효값 개수
 
         # FOV 선택: 주행 의사결정 범위(-85~85deg), 버블 전용(-45~45deg)
-        self.deg_min = -60
-        self.deg_max = 60
-        self.deg_min_bubble = -45
-        self.deg_max_bubble = 45
+        self.deg_min = -52
+        self.deg_max = 52
+        self.deg_min_bubble = -40
+        self.deg_max_bubble = 40
 
         # Safety bubble 
-        self.fixed_bubble_radius = 0.35  # 버블 반경(m) – 마스킹 계산용
-        self.min_bubble_radius = 0.02     # RViz 표시용 동적 반경 최소치
-        self.max_bubble_radius = 0.4     # RViz 표시용 동적 반경 최대치
+        self.fixed_bubble_radius = 0.6  # 버블 반경(m) – 마스킹 계산용
+        self.min_bubble_radius = 0.6     # RViz 표시용 동적 반경 최소치
+        self.max_bubble_radius = 0.6     # RViz 표시용 동적 반경 최대치
         self.bubble_distance_threshold = 10.0  # 동적 표시 스케일 범위
 
         # Best point 정규화 파라미터
-        self.center_bias_strength = 0.003   # 중앙 선호 강도 (작을수록 강한 중앙 선호)
-        self.straight_window_size = 5     # 직선 주행 시 윈도우 크기
-        self.curve_window_size = 20        # 커브 주행 시 윈도우 크기
+        self.center_bias_strength = 0.01   # 중앙 선호 강도 (작을수록 강한 중앙 선호)
+        self.straight_window_size = 20     # 직선 주행 시 윈도우 크기
 
         self.get_logger().info("Merged GapFollow Node Initialized")
 
     # ---------- Utilities ----------
     def preprocess_lidar(self, arr):
         arr = arr.copy()
-        arr[np.isinf(arr)] = self.LIDAR_RANGE_CAP * 3  # 먼 곳은 크게
+        arr[np.isinf(arr)] = self.LIDAR_RANGE_CAP * 2.5  # 먼 곳은 크게
         arr[np.isnan(arr)] = 0.0
         arr[arr > self.LIDAR_RANGE_CAP] = self.LIDAR_RANGE_CAP
         i = 0
@@ -235,7 +234,7 @@ class GapFollow(Node):
         angle_speed = self.max_speed - abs(steering_angle_rad * 13.0) # 11.0)
         angle_speed = np.clip(angle_speed, self.min_speed, self.max_speed)
         # 베스트 포인트까지 거리 기반 보정
-        if distance > 3.0: # 4.0:
+        if distance > 2.3: # 4.0:
             dist_speed = max(self.max_speed, distance / 0.95) # 0.95
         else:
             dist_speed = min(self.max_speed * 1.5, distance / 0.95) # 1.5
@@ -275,14 +274,14 @@ class GapFollow(Node):
         proc_bub = self.preprocess_lidar(ranges_full[min_idx_bub:max_idx_bub])
 
         # **직선 구간 확인 (±15도) - 전처리 후 확인**
-        straight_min_idx = deg_to_idx(-15) - min_idx  # proc 배열 기준 인덱스
-        straight_max_idx = deg_to_idx(15) - min_idx
+        straight_min_idx = deg_to_idx(-5) - min_idx  # proc 배열 기준 인덱스
+        straight_max_idx = deg_to_idx(5) - min_idx
         straight_section = proc[straight_min_idx:straight_max_idx]
         
         # 30.0 (LIDAR_RANGE_CAP * 3) 값만 있는지 확인
         # 0.0이 아닌 유효값이 모두 30.0인지 체크
         valid_vals = straight_section[straight_section > 0.0]
-        is_straight_clear = len(valid_vals) > 0 and np.all(np.isclose(valid_vals, self.LIDAR_RANGE_CAP * 3))
+        is_straight_clear = len(valid_vals) > 0 and np.all(np.isclose(valid_vals, self.LIDAR_RANGE_CAP * 2.5))
 
         # 디스패리티 확장
         proc = self.find_n_extend_disparity(proc, self.disparity_threshold, self.extend_num)
